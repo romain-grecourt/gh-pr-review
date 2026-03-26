@@ -111,6 +111,16 @@ Use three independent axes:
   still hashes to `diff_fingerprint`, and use that fetched patch as the
   only source for exact GitHub diff positions. If the hash differs,
   rebuild the draft.
+- In `submit-to-github`, first resolve PR identity and derive the
+  PR-scoped artifact paths needed for the draft, payload, and runtime
+  cleanup files.
+- Then run `Preflight Cleanup` before loading visible draft contents,
+  using local files as review context, validating freshness,
+  finalizing anchors, or submitting anything.
+- During `Preflight Cleanup`, a metadata-only read of
+  `REVIEW_DRAFT_FILE` is allowed when the draft is not already treated
+  as contaminated, but only to inspect hidden recovery fields such as
+  `context_mode`.
 - In ordinary PR review, do not suppress points against existing PR
   discussion. Before submission, only validate the approved draft
   against the current diff and compute exact diff anchors.
@@ -133,8 +143,13 @@ Use three independent axes:
   PR.
 - Generic helper tooling is allowed only for these non-executing inputs
   and outputs: review draft JSON, review payload JSON, normalized
-  unified diff text fetched from GitHub, and fetched GitHub metadata or
-  discussion data used by this skill.
+  unified diff text fetched from GitHub, the PR-scoped runtime
+  ownership record JSON under
+  `${TMPDIR:-/tmp}/codex-gh-pr-review-runtime/`, and fetched GitHub
+  metadata or discussion data used by this skill.
+- For that runtime ownership record, tooling may parse or serialize only
+  cleanup metadata such as the marker, PID, command, cwd, and temp
+  paths created for prohibited runtime validation.
 - This exception does not allow helper tooling over repository source
   files, copied code snippets, generated projects, temporary repro
   code, or extracted code samples from the PR.
@@ -151,8 +166,16 @@ Use three independent axes:
 - If static evidence is insufficient, write a conditional finding or
   open question, or ask the user whether they want opt-in runtime
   validation as a separate task. Do not self-authorize runtime checks.
-- If runtime validation was started anyway, immediately create or update
-  a PR-scoped runtime ownership record under
+- Before any command that could create runtime-validation state, resolve
+  `PR_REPO`, `PR_NUMBER`, and `PR_REPO_SAFE`.
+- If runtime validation was started anyway, first complete only the
+  metadata-only PR bootstrap needed to derive `PR_REPO`, `PR_NUMBER`,
+  and `PR_REPO_SAFE` if those identifiers are not already known.
+- If that bootstrap still cannot resolve a PR identity, disclose the
+  running or temporary state and stop. Do not create non-PR-scoped
+  placeholders.
+- Then immediately create or update a PR-scoped runtime ownership
+  record under
   `${TMPDIR:-/tmp}/codex-gh-pr-review-runtime/`, for example
   `<pr-repo-safe>__pr-<number>.json`, with the marker, PID, command,
   cwd, and any temp paths created for that validation.
@@ -177,9 +200,9 @@ Use three independent axes:
 - Persist ownership metadata for that runtime state immediately in a
   PR-scoped JSON record under
   `${TMPDIR:-/tmp}/codex-gh-pr-review-runtime/`, for example
-  `<pr-repo-safe>__pr-<number>.json`. If the PR is not yet fully
-  resolved, use a session-scoped placeholder in the same directory and
-  rename it once `PR_REPO` and `PR_NUMBER` are known.
+  `<pr-repo-safe>__pr-<number>.json`.
+- Do not use session-scoped placeholders or non-PR-scoped record names.
+  Preflight cleanup depends on deterministic PR-scoped runtime state.
 - Store review-owned scratch artifacts only under a dedicated temp root,
   for example `${TMPDIR:-/tmp}/codex-gh-pr-review-runtime/`.
 - That record must include at least the review-owned marker, PID,
@@ -191,6 +214,11 @@ Use three independent axes:
   the recovery path before continuing.
 - Remove the runtime ownership record only after the cleanup it
   describes succeeds.
+- During preflight cleanup, if the per-PR draft artifact is not already
+  treated as contaminated, a metadata-only read of `REVIEW_DRAFT_FILE`
+  is allowed to inspect hidden recovery fields such as `context_mode`.
+- Do not trust visible review text or comment bodies during that
+  metadata-only read.
 - During preflight cleanup, only terminate processes and remove files
   carrying that review-owned marker or recorded ownership metadata.
 - If prohibited runtime validation touched a temporary review worktree,
@@ -219,6 +247,12 @@ Use three independent axes:
   repository, then identify the base branch, head branch, head commit, and
   whether a temporary detached review worktree can be created from a local
   checkout of `PR_REPO`.
+- Resolve `PR_REPO`, `PR_NUMBER`, and `PR_REPO_SAFE` before any command
+  that could create runtime-validation state.
+- If prohibited runtime validation started before that bootstrap
+  completed, stop creating new state, finish only the metadata-only PR
+  resolution needed to derive those identifiers, write the PR-scoped
+  runtime ownership record, and then continue termination and cleanup.
 - Detect repository-specific rules before reviewing code, then select
   references from this section only:
   - Read [helidon-review.md](./references/helidon-review.md) when the
@@ -263,6 +297,7 @@ git remote -v
 PR_OWNER="${PR_REPO%%/*}"
 PR_NAME="${PR_REPO#*/}"
 PR_NUMBER="<resolved-pr-number>"
+PR_REPO_SAFE="${PR_REPO//\//__}"
 ```
 
 - After resolving `PR_REPO`, pass `-R <owner/repo>` on every later
@@ -479,8 +514,13 @@ rg --files | rg "Test|IT|Spec"
   payload. When building the submission payload, keep only `event`,
   `commit_id`, `body`, and each retained comment's `path`, `position`,
   and `body`. Drop `draft_id`, `pr_repo`, `pr_number`,
-  `base_ref_name`, `diff_fingerprint`, `discussion_fingerprint`, and
-  each comment's `anchor` metadata from the payload.
+  `base_ref_name`, `context_mode`, `diff_fingerprint`,
+  `discussion_fingerprint`, and each comment's `anchor` metadata from
+  the payload.
+- `REVIEW_PAYLOAD_FILE` must contain only top-level `event`,
+  `commit_id`, `body`, and optional `comments`. Drop every other
+  top-level key from the canonical draft, including future metadata
+  additions.
 - Treat `anchor` as hidden metadata for submit-time relocation. It does
   not need to be rendered in the user-visible draft preview, but every
   inline comment kept in the draft must retain enough anchor metadata to
@@ -495,6 +535,9 @@ rg --files | rg "Test|IT|Spec"
     the normalized diff
   - `line_index_in_hunk` is the zero-based diff-line index within that
     hunk, excluding the hunk header
+  - `hunk_header` is the exact normalized unified-diff hunk header for
+    that `hunk_index` in the same normalized patch used for
+    `diff_fingerprint`, including any trailing context text when present
   - `prefixed_line` is the exact normalized diff line including its
     leading diff marker
   - `context_before` and `context_after` are small ordered lists of

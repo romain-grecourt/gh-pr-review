@@ -12,8 +12,13 @@ approved draft, finalizing one canonical review, and submitting it.
   skill does not support that host.
 - Pure local artifact processing is allowed in this submission workflow
   even under `static-review`, but only for review draft JSON, review
-  payload JSON, normalized diff text, and fetched GitHub metadata or
-  discussion artifacts used by this workflow.
+  payload JSON, the PR-scoped runtime ownership record JSON under
+  `${TMPDIR:-/tmp}/codex-gh-pr-review-runtime/`, normalized diff text,
+  and fetched GitHub metadata or discussion artifacts used by this
+  workflow.
+- For that runtime ownership record, tooling may parse or serialize only
+  cleanup metadata such as the marker, PID, command, cwd, and temp
+  paths created for prohibited runtime validation.
 - Do not apply that exception to repository source files, copied code
   snippets, generated outputs, or ad hoc repro material.
 - Under this exception, tooling may parse, transform, hash, relocate,
@@ -56,30 +61,7 @@ approved draft, finalizing one canonical review, and submitting it.
 
 ## Review Submission Flow
 
-0. Run `Preflight Cleanup` from `SKILL.md` before any other submit-time
-   step.
-
-- If review-owned leftover runtime-validation state is found, clean it
-  up first using the ownership and contamination rules from `SKILL.md`.
-- Load the PR-scoped runtime ownership record described in `SKILL.md`
-  first. If it is missing, fall back to scanning the runtime temp root
-  for matching review-owned markers.
-- Remove that runtime ownership record only after the cleanup it
-  describes succeeds.
-- If local review context was contaminated, discard or recreate
-  `REVIEW_TREE` before relying on local files.
-- If prohibited runtime validation may have influenced visible draft
-  content or review reasoning, invalidate the displayed draft and
-  `REVIEW_DRAFT_FILE` before any freshness checks. Delete or quarantine
-  it, rebuild from clean static inputs, show the refreshed draft, and
-  ask for confirmation again.
-- If contamination cannot be resolved quickly, continue submission logic
-  only from GitHub metadata and fetched diff text when the stored
-  `context_mode` is `github-only` or `review-tree-optional`; if it is
-  `review-tree-required`, stop and refresh the draft from a clean
-  `REVIEW_TREE`.
-
-1. Verify auth, resolve `PR_REPO`, and load PR context.
+0. Bootstrap PR identity and artifact paths.
 
 ```bash
 gh auth status
@@ -89,7 +71,6 @@ gh pr view <pr-number> -R <owner/repo> \
   --json number,url,title,body,baseRefName,headRefName,headRefOid,reviewDecision
 git rev-parse --is-inside-work-tree
 git remote -v
-gh pr diff <pr> -R <owner/repo> --name-only
 ```
 
 Resolve `PR_REPO=OWNER/REPO` using the rules from `SKILL.md` before
@@ -108,14 +89,6 @@ PR_OWNER="${PR_REPO%%/*}"
 PR_NAME="${PR_REPO#*/}"
 ```
 
-Apply the same `REVIEW_TREE` rule from `SKILL.md` before relying on local
-files as context. If local context is available, prefer a temporary
-review worktree created under `SKILL.md`; otherwise continue from GitHub
-diff and metadata. Do not mutate the user's checkout just to make it
-match the PR head. Carry `REVIEW_TREE_CREATED=0` through the submission
-flow and set it to `1` only after `git worktree add` succeeds under the
-`SKILL.md` local-context rules.
-
 Normalize `PR_REPO` by replacing `/` with `__`, then define the draft
 artifact path and the derived review-payload path:
 
@@ -128,6 +101,49 @@ REVIEW_PAYLOAD_FILE="$REVIEW_DRAFT_DIR/${PR_REPO_SAFE}__pr-${PR_NUMBER}__review.
 RUNTIME_STATE_DIR="${TMPDIR:-/tmp}/codex-gh-pr-review-runtime"
 RUNTIME_STATE_FILE="$RUNTIME_STATE_DIR/${PR_REPO_SAFE}__pr-${PR_NUMBER}.json"
 ```
+
+Bootstrap is path resolution only. Do not load `REVIEW_DRAFT_FILE`, use
+local files as review context, validate draft freshness, finalize
+anchors, or submit anything in this step.
+
+1. Run `Preflight Cleanup` from `SKILL.md`.
+
+- Run it immediately after step `0`, using the resolved `PR_REPO`,
+  `PR_NUMBER`, `PR_REPO_SAFE`, `REVIEW_DRAFT_FILE`, and
+  `RUNTIME_STATE_FILE`.
+- If review-owned leftover runtime-validation state is found, clean it
+  up first using the ownership and contamination rules from `SKILL.md`.
+- Load the PR-scoped runtime ownership record described in `SKILL.md`
+  first. If it is missing, fall back to scanning the runtime temp root
+  for matching review-owned markers.
+- Remove that runtime ownership record only after the cleanup it
+  describes succeeds.
+- If the draft is not already treated as contaminated, preflight may do
+  a metadata-only read of `REVIEW_DRAFT_FILE` to inspect hidden
+  recovery fields such as `context_mode`. Do not trust visible review
+  text or comment bodies during that read.
+- If prohibited runtime validation may have influenced visible draft
+  content or review reasoning, invalidate the displayed draft and
+  `REVIEW_DRAFT_FILE` before any freshness checks. Delete or quarantine
+  it, rebuild from clean static inputs, show the refreshed draft, and
+  ask for confirmation again. Do not consult stored `context_mode` to
+  salvage that contaminated draft.
+- If only local review context was contaminated, but the visible draft
+  and review reasoning remain trusted, discard or recreate `REVIEW_TREE`
+  before relying on local files.
+- Only in that trusted-draft case may `context_mode` decide recovery:
+  `github-only` and `review-tree-optional` may continue from GitHub
+  metadata and fetched diff text without local files; if
+  `context_mode` is `review-tree-required`, stop and refresh the draft
+  from a clean `REVIEW_TREE`.
+- If later submit-time recovery or draft refresh needs local files,
+  apply the same `REVIEW_TREE` rule from `SKILL.md` before relying on
+  them. If local context is available, prefer a temporary review
+  worktree created under `SKILL.md`; otherwise continue from GitHub diff
+  and metadata. Do not mutate the user's checkout just to make it match
+  the PR head. Carry `REVIEW_TREE_CREATED=0` through the submission flow
+  and set it to `1` only after `git worktree add` succeeds under the
+  `SKILL.md` local-context rules.
 
 2. Confirm the displayed draft is still current.
 
@@ -147,9 +163,10 @@ is zero-based within the hunk excluding the hunk header. If the
 artifact is missing, unreadable, malformed, contaminated, quarantined,
 or its `draft_id` does not match the latest displayed draft preview, do
 not submit it. Rebuild the draft and ask for confirmation again.
-- Treat stored `context_mode` as authoritative for submit-time recovery:
-  `github-only` and `review-tree-optional` may continue without local
-  files; `review-tree-required` may not.
+- After preflight keeps the draft trusted, treat stored `context_mode`
+  as authoritative for later submit-time recovery: `github-only` and
+  `review-tree-optional` may continue without local files;
+  `review-tree-required` may not.
 
 Then re-read the current PR metadata and compare it to the review
 draft's stored `commit_id`, `base_ref_name`, and `diff_fingerprint`.
@@ -205,11 +222,14 @@ and a `comments` array only for inline comments that were already
 retained in that canonical review. For each retained inline comment,
 keep only `path`, `position`, and `body`. Read these values from
 `REVIEW_DRAFT_FILE`, not from ad-hoc reassembly. Drop `draft_id`,
-`pr_repo`, `pr_number`, `base_ref_name`, `diff_fingerprint`,
-`discussion_fingerprint`, and each comment's `anchor` metadata from
-`REVIEW_PAYLOAD_FILE`. When anchor failures promoted findings into the
-body, the final review body may exceed the normal summary limit to
-enumerate only those promoted findings. At this step,
+`pr_repo`, `pr_number`, `base_ref_name`, `context_mode`,
+`diff_fingerprint`, `discussion_fingerprint`, and each comment's
+`anchor` metadata from `REVIEW_PAYLOAD_FILE`. `REVIEW_PAYLOAD_FILE`
+must contain only top-level `event`, `commit_id`, `body`, and optional
+`comments`. Drop every other top-level key from the canonical draft,
+including future metadata additions. When anchor failures promoted
+findings into the body, the final review body may exceed the normal
+summary limit to enumerate only those promoted findings. At this step,
 `REVIEW_DRAFT_FILE` must already be the finalized canonical review and
 every retained inline comment must already carry its exact GitHub
 `position`.
