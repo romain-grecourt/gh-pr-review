@@ -1,4 +1,4 @@
 interface:
   display_name: "GitHub PR Review"
-  short_description: "Review GitHub pull requests for bugs and risk."
-  default_prompt: "Use $gh-pr-review to review a GitHub pull request reachable through gh for bugs, regressions, missing tests, or to assess whether existing PR review comments still apply after the latest revision; if GitHub write access exists and submission is requested, submit one complete review payload only after confirmation."
+  short_description: "Review GitHub.com pull requests for bugs and risk."
+  default_prompt: "Use $gh-pr-review to review a GitHub.com pull request reachable through gh for bugs, regressions, missing tests, or to assess whether existing PR review comments still apply after the latest revision; if GitHub write access exists and submission is requested, submit one complete review payload only after confirmation."

@@ -1,7 +1,7 @@
 ---
 name: gh-pr-review
 description: >-
-  Review GitHub pull requests reachable through GitHub CLI for bugs,
+  Review GitHub.com pull requests reachable through GitHub CLI for bugs,
   behavioral regressions, risky assumptions, missing validation, and merge
   risk. Use when the user asks for a PR review, asks to review a specific
   GitHub pull request, requests feedback on review comments for that PR, or
@@ -29,6 +29,11 @@ This skill requires GitHub CLI (`gh`) to be installed, authenticated, and
 able to access the target pull request. If that setup is missing, stop and
 tell the user this skill cannot proceed until `gh` is working.
 
+This skill supports pull requests hosted on `github.com` only. If the
+user supplies a PR URL on another host, or needs GitHub Enterprise or
+other non-default host support, stop and tell the user this skill does
+not support that host.
+
 If the user only provides a local patch file, a pasted diff, or any other
 non-GitHub review input, this skill does not apply. Handle that as a
 general code review task instead of trying to force it through this
@@ -41,23 +46,50 @@ Use two output modes:
   GitHub diff positions.
 - `submit-to-github`: after explicit user confirmation, finalize that
   reviewed draft into one canonical review payload and submit it.
+- Ordinary PR review ignores existing PR discussion by default. Do not
+  load prior comments or suppress duplicates unless the user explicitly
+  asks to assess existing review comments or unresolved discussion.
+- When the user explicitly asks to assess existing review comments or
+  unresolved discussion, treat that as a separate discussion-review
+  mode. Use visible GitHub comments and reviews as best-effort input and
+  classify each concern as `still applies`, `does not apply`, or
+  `unclear from available GitHub data`.
 - The canonical review contains the reviewed `commit_id`, the review
   `event`, the final review `body`, and the final set of inline comments.
 - The canonical review also stores the resolved `pr_repo`, `pr_number`,
-  `base_ref_name`, a `diff_fingerprint`, and a
-  `discussion_fingerprint` so a later submission can detect stale
-  diff anchors or stale duplicate-suppression inputs before writing.
-- In `draft-only`, duplicate suppression may be light and best-effort.
-  When preparing a GitHub submission, run conservative duplicate
-  suppression and exact diff-anchor validation against the current PR
-  state.
+  `base_ref_name`, a `diff_fingerprint`, and, only when the review
+  depended on discussion data, a `discussion_fingerprint` so a later
+  submission can detect stale inputs before writing.
+- Persist the latest displayed canonical draft outside the repo as
+  `${TMPDIR:-/tmp}/codex-gh-pr-review/<pr-repo-safe>__pr-<number>.json`,
+  where `<pr-repo-safe>` is the resolved `PR_REPO` with `/` replaced by
+  `__`. Treat that artifact as the only cross-turn source of truth for
+  the draft-to-submit handoff.
+- During submit-time finalization, overwrite that same artifact with the
+  finalized canonical review used for submission. Hidden fields such as
+  exact GitHub diff `position` values may be added in place. If
+  finalization would change any visible review content, stop using that
+  artifact, refresh the draft, and ask for confirmation again instead.
+- Derive `diff_fingerprint` from the exact unified diff reviewed, such
+  as `gh pr diff <pr> -R <owner/repo> --patch --color=never`, normalized
+  consistently before hashing. Do not derive it from the changed-file
+  list alone.
+- The draft does not need to retain the full patch text. During
+  submission, re-fetch the normalized exact unified diff, verify that it
+  still hashes to `diff_fingerprint`, and use that fetched patch as the
+  only source for exact GitHub diff positions. If the hash differs,
+  rebuild the draft.
+- In ordinary PR review, do not suppress points against existing PR
+  discussion. Before submission, only validate the approved draft
+  against the current diff and compute exact diff anchors.
 - After a draft is shown, submission may add exact GitHub diff positions
-  only. If finalization would suppress, rewrite, add, drop, or relocate
-  any visible review point, discard the earlier approval, show the
-  refreshed draft, and ask for confirmation again.
-- If the reviewed head commit, PR diff, or discussion changes after the
-  draft is prepared, discard it, rebuild the draft, show the refreshed
-  version, and ask for confirmation again before submitting.
+  only. If finalization would drop or relocate any visible review point,
+  discard the earlier approval, show the refreshed draft, and ask for
+  confirmation again.
+- If the reviewed head commit or PR diff changes after the draft is
+  prepared, discard it, rebuild the draft, show the refreshed version,
+  and ask for confirmation again before submitting. If the draft used
+  discussion data, treat relevant discussion changes the same way.
 
 ## Gather Context
 
@@ -78,21 +110,20 @@ Use two output modes:
     [github-submit-review.md](./references/github-submit-review.md) only
     when the user explicitly wants `submit-to-github`.
 - Resolve the base repository before later review commands:
+  - Because this skill is scoped to `github.com`, use `OWNER/REPO`
+    selectors, not `[HOST/]OWNER/REPO`.
   - If the user supplies a full PR URL, use that URL for the initial
     `gh pr view` call.
   - If the user supplies only a PR number, prefer an explicit
     `OWNER/REPO` and use `gh pr view <pr> -R <owner/repo>` for the
     initial metadata call.
-  - Use `gh repo view --json nameWithOwner` only when the current
-    checkout is clearly the intended repository, then feed the resolved
-    repo into `gh pr view <pr> -R <owner/repo>`.
-  - If the repository is still ambiguous, stop and ask for a PR URL or
-    `OWNER/REPO`.
+  - If the user supplies only a PR number and no explicit `OWNER/REPO`,
+    stop and ask for a full PR URL or `OWNER/REPO`. Do not infer the
+    repository from the current checkout.
 - Load GitHub and local checkout metadata:
 
 ```bash
 gh auth status
-gh repo view --json nameWithOwner   # only when resolving repo from current checkout
 gh pr view <pr-url> \
   --json number,url,title,body,baseRefName,headRefName,headRefOid,isDraft,author
 gh pr view <pr-number> -R <owner/repo> \
@@ -101,12 +132,23 @@ git rev-parse --is-inside-work-tree
 git remote -v
 ```
 
-- Resolve `PR_REPO=OWNER/REPO` from explicit user input, the current
-  checkout when appropriate, or the returned PR `url`.
+- Resolve `PR_REPO=OWNER/REPO` from explicit user input or the returned
+  PR `url`.
+- Split `PR_REPO` once and reuse explicit path variables on every later
+  `gh api` call:
+
+```bash
+PR_OWNER="${PR_REPO%%/*}"
+PR_NAME="${PR_REPO#*/}"
+PR_NUMBER="<resolved-pr-number>"
+```
+
 - After resolving `PR_REPO`, pass `-R <owner/repo>` on every later
-  `gh pr` command and use `repos/{owner}/{repo}/...` on every `gh api`
-  call. Do not fall back to whatever repository happens to be checked out
-  locally.
+  `gh pr` command and use explicit `repos/$PR_OWNER/$PR_NAME/...` paths
+  on every `gh api` call. This skill assumes the default `github.com`
+  host on every later `gh` and `gh api` call. Do not fall back to
+  whatever repository happens to be checked out locally, and do not rely
+  on `gh api` placeholder substitution from the current checkout.
 - Pull the changed-file list early so review time stays focused:
 
 ```bash
@@ -118,24 +160,23 @@ gh pr diff <pr> -R <owner/repo> --name-only
   so the review can test whether each concern still applies on the
   current head.
 
-- In `draft-only`, loading existing PR discussion is optional. Before
-  finalizing a review for GitHub submission, load the existing PR
-  discussion so conservative duplicate suppression happens against the
-  latest available state:
+- For ordinary PR review and `submit-to-github`, skip discussion loading
+  and do not suppress duplicates against prior comments. Load discussion
+  only for explicit discussion-review requests:
 
 ```bash
 gh pr view <pr> -R <owner/repo> --comments
-gh api --paginate "repos/{owner}/{repo}/issues/{pr}/comments?per_page=100"
-gh api --paginate "repos/{owner}/{repo}/pulls/{pr}/comments?per_page=100"
-gh api --paginate "repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100"
+gh api --paginate "repos/$PR_OWNER/$PR_NAME/issues/$PR_NUMBER/comments?per_page=100"
+gh api --paginate "repos/$PR_OWNER/$PR_NAME/pulls/$PR_NUMBER/comments?per_page=100"
+gh api --paginate "repos/$PR_OWNER/$PR_NAME/pulls/$PR_NUMBER/reviews?per_page=100"
 ```
 
 - Treat the paginated `gh api` results above as best-effort
-  duplicate-check and discussion-review inputs. They may not capture
-  complete thread state, so use them conservatively and suppress only
-  obvious duplicates.
+  discussion-review inputs. They may not capture complete thread state,
+  so use them to classify visible concerns only as `still applies`,
+  `does not apply`, or `unclear from available GitHub data`.
   `gh pr view <pr> -R <owner/repo> --comments` is only a readable summary
-  and should not control suppression decisions.
+  and should not control those classifications by itself.
 
 - When local filesystem context is used, define `REVIEW_TREE` as the only
   local filesystem allowed for surrounding implementation,
@@ -238,11 +279,90 @@ rg --files | rg "Test|IT|Spec"
   `event`, the final review `body`, and the final set of inline
   comments.
 - Store enough metadata with the draft to prove it is still current
-  later: the resolved `pr_repo`, `pr_number`, `base_ref_name`, a
-  `diff_fingerprint` from the exact diff or changed-file set reviewed,
-  and a `discussion_fingerprint` from the discussion data used for
-  duplicate suppression or existing-comment review. If discussion was
-  not loaded yet, store `discussion_fingerprint=not-loaded`.
+  later: a generated `draft_id`, the resolved `pr_repo`, `pr_number`,
+  `commit_id`, `base_ref_name`, a `diff_fingerprint` from the normalized
+  exact unified diff reviewed, and, only when discussion data shaped the
+  review, a `discussion_fingerprint` from the discussion data used for
+  existing-comment review.
+- The per-PR draft artifact must be valid JSON with this schema. The
+  same file starts as the displayed draft artifact and, after
+  submit-time finalization, becomes the finalized submit-ready artifact:
+
+```json
+{
+  "draft_id": "<latest approved draft id>",
+  "pr_repo": "owner/repo",
+  "pr_number": 123,
+  "commit_id": "<reviewed headRefOid>",
+  "base_ref_name": "main",
+  "diff_fingerprint": "<normalized exact diff hash>",
+  "discussion_fingerprint": "<discussion hash>",
+  "event": "COMMENT",
+  "body": "Concise final review body",
+  "comments": [
+    {
+      "path": "path/to/file",
+      "body": "Short, concrete review comment",
+      "position": 123,
+      "anchor": {
+        "line_type": "addition",
+        "left_line": 122,
+        "right_line": 123,
+        "hunk_index": 1,
+        "line_index_in_hunk": 7,
+        "hunk_header": "@@ -45,6 +45,12 @@",
+        "prefixed_line": "+ actual changed line",
+        "context_before": [
+          " context line before"
+        ],
+        "context_after": [
+          " context line after"
+        ]
+      }
+    }
+  ]
+}
+```
+
+- Omit `discussion_fingerprint` when the review did not depend on
+  discussion data. Do not require a separate preview hash or other
+  hidden in-memory state to resume submission.
+- The example above shows `position` only to document the finalized
+  submit-ready form. Omit `position` in the ordinary displayed draft
+  artifact. During submit-time finalization, add exact GitHub
+  `position` values back into each retained inline comment in that same
+  artifact before submission.
+- Treat `anchor` as hidden metadata for submit-time relocation. It does
+  not need to be rendered in the user-visible draft preview, but every
+  inline comment kept in the draft must retain enough anchor metadata to
+  be re-positioned against the re-fetched patch later.
+- Anchor field semantics are fixed:
+  - `line_type` is one of `addition`, `deletion`, or `context`
+  - `left_line` is the absolute pre-image file line number, or `null`
+    when the anchored diff line has no left-side line
+  - `right_line` is the absolute post-image file line number, or `null`
+    when the anchored diff line has no right-side line
+  - `hunk_index` is the zero-based hunk occurrence within that file in
+    the normalized diff
+  - `line_index_in_hunk` is the zero-based diff-line index within that
+    hunk, excluding the hunk header
+  - `prefixed_line` is the exact normalized diff line including its
+    leading diff marker
+  - `context_before` and `context_after` are small ordered lists of
+    nearby normalized diff lines used only to disambiguate relocation
+- Whenever a draft preview is rendered or refreshed, create the draft
+  directory if needed and write or overwrite the per-PR draft artifact
+  under `${TMPDIR:-/tmp}/codex-gh-pr-review/`. Generate a new `draft_id`
+  whenever visible review content changes. Exception: the rendered
+  `Draft ID: <draft_id>` line is metadata for the handoff and does not
+  itself count as visible review content for draft rotation. Derive the
+  new `draft_id` after the rest of the visible draft content is fixed,
+  and do not rotate it again solely because that metadata line changed.
+  During submit-time finalization, overwrite the same artifact in place
+  with exact `position` values and any other hidden submit-ready fields;
+  do not rotate `draft_id` for hidden field updates alone. If the
+  artifact cannot be written, stop and tell the user
+  `submit-to-github` cannot proceed until draft storage works.
 - Give each finding a short title plus the impact, supporting evidence,
   and a concrete file reference.
 - Use simple, tight prose: short sentences, short paragraphs, and usually
@@ -257,23 +377,28 @@ rg --files | rg "Test|IT|Spec"
   a specific changed file and diff line. Start each inline comment with a
   short statement of the core fact, then use a new paragraph for impact or
   evidence.
-- In `draft-only`, duplicate suppression may be light and best-effort.
-  Before submission, suppress only points clearly already covered in the
-  PR discussion. Dedupe the underlying point, not just exact wording. If
-  the available discussion data is incomplete or the status is
-  ambiguous, keep the point. Repost only when a new revision introduces
-  a materially different instance of the issue. If this finalization
-  changes any visible review content, refresh the draft and ask for
-  confirmation again.
+- In ordinary review, do not suppress a finding just because a similar
+  point may already exist on the PR. Before submission, only recompute
+  exact GitHub diff positions for the approved inline comments. If
+  anchor validation changes any visible review content, refresh the
+  draft and ask for confirmation again.
+- In discussion-review mode, do not promise complete thread state or
+  full duplicate detection. Report each visible concern as `still
+  applies`, `does not apply`, or `unclear from available GitHub data`.
 - In `draft-only`, show the changed file path and a human line hint when
   helpful. Compute exact GitHub diff positions only when preparing a
   submission. If a file-specific point cannot be anchored reliably at
-  submission time, move it into the final review body, refresh the
-  draft, and ask for confirmation again instead of guessing.
+  submission time, move it into a `Promoted Findings` section in the
+  final review body, refresh the draft, and ask for confirmation again
+  instead of guessing.
 - Keep the final review body synthetic, concise, and non-duplicative. It
   should state the overall shape of the findings in simple language, stay
   at 2 sentences or fewer unless the user asks for more, and never
-  repeat, list, or point back to the inline comments.
+  repeat, list, or point back to the inline comments. Exception: if
+  approved inline comments are promoted because they cannot be anchored
+  reliably, the refreshed draft may add a `Promoted Findings` section
+  that enumerates only those migrated findings and may exceed the normal
+  body limit.
 - Default the review state/event to `COMMENT` unless the user explicitly
   requests another state.
 - Do not use first person in the review text.
@@ -300,6 +425,8 @@ iterating with the user. Use this layout:
   - show the exact inline comment text as a markdown blockquote
 - After the inline comments, render `---`, then `State: <state>`, then
   the final review body directly below it with no extra `Comment:` label.
+- After the final review body, render `Draft ID: <draft_id>` on its own
+  line.
 - Render the latest user-visible draft. If submission finalization later
   changes any visible review content, show the refreshed draft before
   asking for confirmation again.
@@ -307,11 +434,13 @@ iterating with the user. Use this layout:
 ## Handle Common Variants
 
 - Review a single PR: inspect GitHub metadata, diff, and targeted
-  files.
+  files. Ignore existing PR discussion unless the user explicitly asks
+  for discussion review.
 - Review existing PR comments: load the latest PR comments and reviews,
-  treat them as input, and assess whether each concern still applies on
-  the current head. Call out agreements, disagreements, and unresolved
-  risk instead of drafting a second review that ignores the discussion
+  treat visible discussion as best-effort input, and assess whether each
+  concern `still applies`, `does not apply`, or is `unclear from
+  available GitHub data` on the current head. Call out unresolved risk
+  instead of drafting a second review that ignores the discussion
   already on the PR.
 - Review stacked or large changes: break the review into commits or
   subsystems, or explicitly scope the review to the highest-risk files
