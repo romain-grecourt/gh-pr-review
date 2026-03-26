@@ -39,32 +39,61 @@ non-GitHub review input, this skill does not apply. Handle that as a
 general code review task instead of trying to force it through this
 workflow.
 
-Use two output modes:
-- `draft-only`: build a review draft for the target PR and render it
-  locally without changing GitHub. In draft mode, inline comments may be
-  shown with changed file paths and human line hints instead of final
-  GitHub diff positions.
-- `submit-to-github`: after explicit user confirmation, finalize that
-  reviewed draft into one canonical review payload and submit it.
+Use three independent axes:
+- Analysis policy: `static-review`.
+  This policy governs how evidence is gathered and applies to all
+  ordinary uses of this skill.
+- Output mode: `draft-only`.
+  Build and render a local review draft without changing GitHub. In
+  draft mode, inline comments may be shown with changed file paths and
+  human line hints instead of final GitHub diff positions.
+- Output mode: `submit-to-github`.
+  After explicit user confirmation, finalize and submit an already
+  approved review draft to GitHub.
+- Review scope: `ordinary-pr-review` or `discussion-review`.
+  This scope governs whether prior PR discussion is ignored or used as
+  best-effort input for reassessing visible concerns.
+- `submit-to-github` changes only how the review is finalized and
+  submitted. It does not relax `static-review`.
+- `discussion-review` is a scope variant, not a third output mode.
+- Unless explicitly requested otherwise, `discussion-review` defaults to
+  `draft-only`.
+- If the user wants runtime validation, builds, tests, or repro
+  execution, treat that as a separate opt-in task outside this skill.
 - Ordinary PR review ignores existing PR discussion by default. Do not
   load prior comments or suppress duplicates unless the user explicitly
   asks to assess existing review comments or unresolved discussion.
 - When the user explicitly asks to assess existing review comments or
-  unresolved discussion, treat that as a separate discussion-review
-  mode. Use visible GitHub comments and reviews as best-effort input and
+  unresolved discussion, treat that as `discussion-review` scope. Use
+  visible GitHub comments and reviews as best-effort input and
   classify each concern as `still applies`, `does not apply`, or
   `unclear from available GitHub data`.
 - The canonical review contains the reviewed `commit_id`, the review
   `event`, the final review `body`, and the final set of inline comments.
 - The canonical review also stores the resolved `pr_repo`, `pr_number`,
-  `base_ref_name`, a `diff_fingerprint`, and, only when the review
-  depended on discussion data, a `discussion_fingerprint` so a later
-  submission can detect stale inputs before writing.
+  `base_ref_name`, a `context_mode`, a `diff_fingerprint`, and, only
+  when the review depended on discussion data, a
+  `discussion_fingerprint` so a later submission can detect stale
+  inputs before writing.
+- `context_mode` is one of `github-only`, `review-tree-optional`, or
+  `review-tree-required`.
+- Use `github-only` when no local filesystem context shaped the visible
+  draft.
+- Use `review-tree-optional` when local files were consulted, but the
+  visible draft can still be revalidated from GitHub diff, metadata,
+  and stored discussion artifacts alone.
+- Use `review-tree-required` when any visible draft content depends on
+  clean `REVIEW_TREE` context that cannot be reconstructed safely from
+  GitHub artifacts alone.
 - Persist the latest displayed canonical draft outside the repo as
   `${TMPDIR:-/tmp}/codex-gh-pr-review/<pr-repo-safe>__pr-<number>.json`,
   where `<pr-repo-safe>` is the resolved `PR_REPO` with `/` replaced by
   `__`. Treat that artifact as the only cross-turn source of truth for
   the draft-to-submit handoff.
+- If prohibited runtime validation may have influenced that artifact or
+  the visible draft it represents, treat it as contaminated, do not
+  reuse it, and rebuild from clean static inputs before any submit
+  path.
 - Any separate `review.json` payload file used for submission is a
   disposable derived artifact only. Rebuild it from the finalized draft
   artifact when needed, and do not treat it as cross-turn state.
@@ -93,6 +122,96 @@ Use two output modes:
   prepared, discard it, rebuild the draft, show the refreshed version,
   and ask for confirmation again before submitting. If the draft used
   discussion data, treat relevant discussion changes the same way.
+
+## Hard Constraints
+
+- Use the `static-review` analysis policy for both output modes unless
+  the user explicitly asks for a separate runtime-validation task.
+- In `static-review`, do not use commands or runtimes to build, test,
+  compile, interpret, fuzz, or otherwise execute repository code,
+  generated project outputs, or temporary repro code derived from the
+  PR.
+- Generic helper tooling is allowed only for these non-executing inputs
+  and outputs: review draft JSON, review payload JSON, normalized
+  unified diff text fetched from GitHub, and fetched GitHub metadata or
+  discussion data used by this skill.
+- This exception does not allow helper tooling over repository source
+  files, copied code snippets, generated projects, temporary repro
+  code, or extracted code samples from the PR.
+- Under this exception, tooling may parse, transform, hash, relocate,
+  or serialize review artifacts, but must not import, evaluate,
+  compile, test, or run repository code.
+- Disallowed examples when they exercise the PR include `mvn`,
+  `gradle`, `npm`, `pnpm`, `yarn`, `pytest`, `go test`, `cargo test`,
+  repository scripts, and ad hoc `java`, `javac`, `python`, or `node`
+  repro commands.
+- In this skill, "trace behavior" means static reasoning only: inspect
+  the diff, surrounding code, call sites, configuration, existing tests,
+  and fixtures without executing them.
+- If static evidence is insufficient, write a conditional finding or
+  open question, or ask the user whether they want opt-in runtime
+  validation as a separate task. Do not self-authorize runtime checks.
+- If runtime validation was started anyway, immediately create or update
+  a PR-scoped runtime ownership record under
+  `${TMPDIR:-/tmp}/codex-gh-pr-review-runtime/`, for example
+  `<pr-repo-safe>__pr-<number>.json`, with the marker, PID, command,
+  cwd, and any temp paths created for that validation.
+- Then terminate any validation process, session, or background job you
+  started for that validation, wait for it to exit when practical, and
+  clean up temporary repro files or scratch artifacts created only for
+  that validation when safe.
+- Do not kill user-owned processes or delete non-ephemeral files.
+- If cleanup cannot be completed quickly, disclose what is still running
+  or what temporary state remains, then return to static review.
+
+## Preflight Cleanup
+
+- Before starting or resuming a review, detect review-owned leftover
+  runtime-validation state from an earlier interrupted attempt.
+- This includes background jobs, long-running sessions, temporary repro
+  files, scratch classes, and other ephemeral artifacts created only
+  for prohibited runtime validation.
+- Any accidental runtime-validation process or scratch artifact created
+  by this skill must use a review-owned marker derived from the PR,
+  such as `codex-gh-pr-review-runtime-<pr-repo-safe>-<draft-id>`.
+- Persist ownership metadata for that runtime state immediately in a
+  PR-scoped JSON record under
+  `${TMPDIR:-/tmp}/codex-gh-pr-review-runtime/`, for example
+  `<pr-repo-safe>__pr-<number>.json`. If the PR is not yet fully
+  resolved, use a session-scoped placeholder in the same directory and
+  rename it once `PR_REPO` and `PR_NUMBER` are known.
+- Store review-owned scratch artifacts only under a dedicated temp root,
+  for example `${TMPDIR:-/tmp}/codex-gh-pr-review-runtime/`.
+- That record must include at least the review-owned marker, PID,
+  command, cwd, and any temp paths created for the prohibited runtime
+  validation.
+- During preflight cleanup, load that record first. If it is missing,
+  fall back to scanning the runtime temp root for matching markers.
+- If found, terminate or clean them up using the same ownership rules as
+  the recovery path before continuing.
+- Remove the runtime ownership record only after the cleanup it
+  describes succeeds.
+- During preflight cleanup, only terminate processes and remove files
+  carrying that review-owned marker or recorded ownership metadata.
+- If prohibited runtime validation touched a temporary review worktree,
+  local checkout clone, or any local files being used as review context,
+  treat that local context as contaminated.
+- Do not continue review reasoning from contaminated local context.
+- If a contaminated `REVIEW_TREE` exists, remove it and recreate it from
+  the PR head before using local context again.
+- If prohibited runtime validation may have influenced any visible draft
+  content or review reasoning, treat the displayed draft and the stored
+  per-PR draft artifact as contaminated too.
+- If unsure, fail closed and treat the draft as contaminated.
+- Do not preview, finalize, or submit a contaminated draft. Delete it
+  or move it aside outside the active draft path, rebuild from clean
+  static inputs, and require fresh user confirmation before any
+  submission.
+- If clean recreation is inconvenient or uncertain, fall back to GitHub
+  diff and metadata only and state that local context is unavailable.
+- Do not kill user-owned processes or delete non-ephemeral files.
+- If cleanup cannot be completed quickly, disclose what remains and
+  continue only with static review.
 
 ## Gather Context
 
@@ -163,9 +282,10 @@ gh pr diff <pr> -R <owner/repo> --name-only
   so the review can test whether each concern still applies on the
   current head.
 
-- For ordinary PR review and `submit-to-github`, skip discussion loading
-  and do not suppress duplicates against prior comments. Load discussion
-  only for explicit discussion-review requests:
+- For `ordinary-pr-review`, whether `draft-only` or `submit-to-github`,
+  skip discussion loading and do not suppress duplicates against prior
+  comments. Load discussion only for explicit `discussion-review`
+  requests:
 
 ```bash
 gh pr view <pr> -R <owner/repo> --comments
@@ -184,6 +304,8 @@ gh api --paginate "repos/$PR_OWNER/$PR_NAME/pulls/$PR_NUMBER/reviews?per_page=10
 - When local filesystem context is used, define `REVIEW_TREE` as the only
   local filesystem allowed for surrounding implementation,
   configuration, and test context.
+- Never use a contaminated or previously exercised `REVIEW_TREE` for
+  static review.
 - If the current checkout clearly belongs to `PR_REPO` and a detached
   review worktree can be created without extra friction, prefer creating
   a temporary detached review worktree at the exact PR head and use that
@@ -247,9 +369,13 @@ fi
   `REVIEW_TREE` when local context is used.
 - Keep the review static and fast. Do not run tests, execute scripts, add
   temporary repro changes, instrument the code, or otherwise exercise the
-  PR. Analyze behavior from the diff, surrounding code, and existing tests,
-  and only trace behavior when that reasoning is cheap. Do deeper or more
-  expensive analysis only when the user explicitly asks for it.
+  PR.
+- In this skill, cheap tracing means static inspection only: follow code
+  paths in the diff, inspect adjacent call sites, and compare with
+  existing tests, fixtures, and configuration without executing them.
+- If static inspection still leaves uncertainty, keep the finding
+  conditional or ask whether the user wants opt-in runtime validation as
+  a separate task.
 
 - Use fast repo search only inside `REVIEW_TREE` to find adjacent call
   sites, tests, and related configuration:
@@ -264,8 +390,8 @@ rg --files | rg "Test|IT|Spec"
 
 - Lead with issues that could ship a bug, break compatibility, corrupt
   data, weaken security, or hide failing behavior.
-- Analyze behavior, not just structure, but keep tracing cheap and
-  grounded in the diff, surrounding code, and existing tests.
+- Analyze behavior, not just structure, but keep that analysis static,
+  cheap, and grounded in the diff, surrounding code, and existing tests.
 - Flag missing or weak tests when the change meaningfully alters behavior
   and existing coverage does not cover the new path.
 - Treat style issues as low priority unless they obscure a real defect or
@@ -288,9 +414,10 @@ rg --files | rg "Test|IT|Spec"
   comments.
 - Store enough metadata with the draft to prove it is still current
   later: a generated `draft_id`, the resolved `pr_repo`, `pr_number`,
-  `commit_id`, `base_ref_name`, a `diff_fingerprint` from the normalized
-  exact unified diff reviewed, and, only when discussion data shaped the
-  review, a `discussion_fingerprint` from the discussion data used for
+  `commit_id`, `base_ref_name`, `context_mode`, a
+  `diff_fingerprint` from the normalized exact unified diff reviewed,
+  and, only when discussion data shaped the review, a
+  `discussion_fingerprint` from the discussion data used for
   existing-comment review.
 - The per-PR draft artifact must be valid JSON with this schema. The
   same file starts as the displayed draft artifact and, after
@@ -304,6 +431,7 @@ rg --files | rg "Test|IT|Spec"
   "pr_number": 123,
   "commit_id": "<reviewed headRefOid>",
   "base_ref_name": "main",
+  "context_mode": "review-tree-optional",
   "diff_fingerprint": "<normalized exact diff hash>",
   "discussion_fingerprint": "<discussion hash>",
   "event": "COMMENT",
@@ -336,6 +464,12 @@ rg --files | rg "Test|IT|Spec"
 - Omit `discussion_fingerprint` when the review did not depend on
   discussion data. Do not require a separate preview hash or other
   hidden in-memory state to resume submission.
+- `context_mode` controls submit-time recovery when local context is
+  unavailable: `github-only` means no local files shaped the draft;
+  `review-tree-optional` means local files were consulted but the
+  visible draft can still be revalidated from GitHub artifacts alone;
+  `review-tree-required` means the draft must be rebuilt from a clean
+  `REVIEW_TREE` before it can be trusted again.
 - The example above shows `position` only to document the finalized
   draft form. Omit `position` in the ordinary displayed draft artifact.
   During submit-time finalization, add exact GitHub `position` values
@@ -397,7 +531,7 @@ rg --files | rg "Test|IT|Spec"
   exact GitHub diff positions for the approved inline comments. If
   anchor validation changes any visible review content, refresh the
   draft and ask for confirmation again.
-- In discussion-review mode, do not promise complete thread state or
+- In `discussion-review` scope, do not promise complete thread state or
   full duplicate detection. Report each visible concern as `still
   applies`, `does not apply`, or `unclear from available GitHub data`.
 - In `draft-only`, show the changed file path and a human line hint when

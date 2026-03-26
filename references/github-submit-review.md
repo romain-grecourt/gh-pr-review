@@ -10,12 +10,21 @@ approved draft, finalizing one canonical review, and submitting it.
 - This workflow supports pull requests hosted on `github.com` only. If
   the user supplies a PR URL on another host, stop and tell them this
   skill does not support that host.
+- Pure local artifact processing is allowed in this submission workflow
+  even under `static-review`, but only for review draft JSON, review
+  payload JSON, normalized diff text, and fetched GitHub metadata or
+  discussion artifacts used by this workflow.
+- Do not apply that exception to repository source files, copied code
+  snippets, generated outputs, or ad hoc repro material.
+- Under this exception, tooling may parse, transform, hash, relocate,
+  or serialize review artifacts, but must not import, evaluate,
+  compile, test, or run repository code.
 - Verify a real GitHub write path exists before attempting any write.
 - Ask for explicit confirmation before creating a review.
 - Load the per-PR draft artifact from
   `${TMPDIR:-/tmp}/codex-gh-pr-review/<pr-repo-safe>__pr-<number>.json`.
-  If it is missing, unreadable, or malformed, rebuild the draft from
-  `SKILL.md` and ask for confirmation again.
+  If it is missing, unreadable, malformed, contaminated, or quarantined,
+  rebuild the draft from `SKILL.md` and ask for confirmation again.
 - If write access or confirmation is missing, fall back to `draft-only`.
 - If the displayed draft is stale because the PR diff changed, rebuild
   it from `SKILL.md` and ask for confirmation again. If the draft
@@ -31,6 +40,8 @@ approved draft, finalizing one canonical review, and submitting it.
   before writing anything to GitHub.
 - Submit only from the `draft_id` shown in the latest displayed draft
   preview.
+- Never submit a draft artifact that preflight cleanup marked
+  contaminated by prohibited runtime validation.
 - During submission, only exact GitHub diff positions may be added
   silently. If anchor validation would drop or relocate any visible
   review point, stop using that draft, show the refreshed draft, and
@@ -44,6 +55,29 @@ approved draft, finalizing one canonical review, and submitting it.
   as separate standalone comments.
 
 ## Review Submission Flow
+
+0. Run `Preflight Cleanup` from `SKILL.md` before any other submit-time
+   step.
+
+- If review-owned leftover runtime-validation state is found, clean it
+  up first using the ownership and contamination rules from `SKILL.md`.
+- Load the PR-scoped runtime ownership record described in `SKILL.md`
+  first. If it is missing, fall back to scanning the runtime temp root
+  for matching review-owned markers.
+- Remove that runtime ownership record only after the cleanup it
+  describes succeeds.
+- If local review context was contaminated, discard or recreate
+  `REVIEW_TREE` before relying on local files.
+- If prohibited runtime validation may have influenced visible draft
+  content or review reasoning, invalidate the displayed draft and
+  `REVIEW_DRAFT_FILE` before any freshness checks. Delete or quarantine
+  it, rebuild from clean static inputs, show the refreshed draft, and
+  ask for confirmation again.
+- If contamination cannot be resolved quickly, continue submission logic
+  only from GitHub metadata and fetched diff text when the stored
+  `context_mode` is `github-only` or `review-tree-optional`; if it is
+  `review-tree-required`, stop and refresh the draft from a clean
+  `REVIEW_TREE`.
 
 1. Verify auth, resolve `PR_REPO`, and load PR context.
 
@@ -91,6 +125,8 @@ PR_REPO_SAFE="${PR_REPO//\//__}"
 REVIEW_DRAFT_DIR="${TMPDIR:-/tmp}/codex-gh-pr-review"
 REVIEW_DRAFT_FILE="$REVIEW_DRAFT_DIR/${PR_REPO_SAFE}__pr-${PR_NUMBER}.json"
 REVIEW_PAYLOAD_FILE="$REVIEW_DRAFT_DIR/${PR_REPO_SAFE}__pr-${PR_NUMBER}__review.json"
+RUNTIME_STATE_DIR="${TMPDIR:-/tmp}/codex-gh-pr-review-runtime"
+RUNTIME_STATE_FILE="$RUNTIME_STATE_DIR/${PR_REPO_SAFE}__pr-${PR_NUMBER}.json"
 ```
 
 2. Confirm the displayed draft is still current.
@@ -98,18 +134,22 @@ REVIEW_PAYLOAD_FILE="$REVIEW_DRAFT_DIR/${PR_REPO_SAFE}__pr-${PR_NUMBER}__review.
 Load and parse `REVIEW_DRAFT_FILE` first. It must contain the latest
 approved `draft_id` and the exact canonical draft schema from
 `SKILL.md`: `pr_repo`, `pr_number`, `commit_id`, `base_ref_name`,
-`diff_fingerprint`, optional `discussion_fingerprint`, `event`, `body`,
-and `comments`. Each stored inline comment must include hidden `anchor`
-metadata sufficient to relocate it later: `line_type`, `left_line`,
-`right_line`, `hunk_index`, `line_index_in_hunk`, `hunk_header`,
-`prefixed_line`, `context_before`, and `context_after`. Use the
-semantics defined in `SKILL.md`: `left_line` is the absolute pre-image
-line number or `null`, `right_line` is the absolute post-image line
-number or `null`, `hunk_index` is zero-based within the file, and
-`line_index_in_hunk` is zero-based within the hunk excluding the hunk
-header. If the artifact is missing, unreadable, malformed, or its
-`draft_id` does not match the latest displayed draft preview, do not
-submit it. Rebuild the draft and ask for confirmation again.
+`context_mode`, `diff_fingerprint`, optional
+`discussion_fingerprint`, `event`, `body`, and `comments`. Each stored
+inline comment must include hidden `anchor` metadata sufficient to
+relocate it later: `line_type`, `left_line`, `right_line`,
+`hunk_index`, `line_index_in_hunk`, `hunk_header`, `prefixed_line`,
+`context_before`, and `context_after`. Use the semantics defined in
+`SKILL.md`: `left_line` is the absolute pre-image line number or
+`null`, `right_line` is the absolute post-image line number or `null`,
+`hunk_index` is zero-based within the file, and `line_index_in_hunk`
+is zero-based within the hunk excluding the hunk header. If the
+artifact is missing, unreadable, malformed, contaminated, quarantined,
+or its `draft_id` does not match the latest displayed draft preview, do
+not submit it. Rebuild the draft and ask for confirmation again.
+- Treat stored `context_mode` as authoritative for submit-time recovery:
+  `github-only` and `review-tree-optional` may continue without local
+  files; `review-tree-required` may not.
 
 Then re-read the current PR metadata and compare it to the review
 draft's stored `commit_id`, `base_ref_name`, and `diff_fingerprint`.
@@ -136,7 +176,9 @@ required `discussion_fingerprint` differs from the review draft, do not
 submit it. Rerun the `SKILL.md` draft-building steps so the reviewed
 draft and stored metadata are recalculated against current PR state,
 rebuild the temporary review worktree if one was used, then ask for
-confirmation again.
+confirmation again. Likewise, if `context_mode` is
+`review-tree-required` and a clean `REVIEW_TREE` cannot be created when
+the draft needs any refresh or local-context recovery, do not submit it.
 
 3. Finalize the approved draft into one canonical review.
 
@@ -209,7 +251,8 @@ gh api -X POST "repos/$PR_OWNER/$PR_NAME/pulls/$PR_NUMBER/reviews" --input "$REV
 
 6. After successful submission or after abandoning the review, remove any
 temporary review worktree created for it and delete
-`REVIEW_DRAFT_FILE` plus `REVIEW_PAYLOAD_FILE`.
+`REVIEW_DRAFT_FILE`, `REVIEW_PAYLOAD_FILE`, plus `RUNTIME_STATE_FILE`
+if it exists.
 
 ```bash
 if [ "${REVIEW_TREE_CREATED:-0}" = "1" ]; then
@@ -217,17 +260,22 @@ if [ "${REVIEW_TREE_CREATED:-0}" = "1" ]; then
 fi
 rm -f "$REVIEW_DRAFT_FILE"
 rm -f "$REVIEW_PAYLOAD_FILE"
+rm -f "$RUNTIME_STATE_FILE"
 ```
 
 If no temporary review worktree was created, skip the worktree-removal
 step. Do not force-remove a dirty temporary review worktree. If
 worktree cleanup fails, stop immediately and do not delete
-`REVIEW_DRAFT_FILE` or `REVIEW_PAYLOAD_FILE`. If draft-artifact cleanup
+`REVIEW_DRAFT_FILE`, `REVIEW_PAYLOAD_FILE`, or `RUNTIME_STATE_FILE`. If
+draft-artifact cleanup
 fails, tell the user that stale local draft state remains and rebuild
 instead of trusting it on a later submit. If only
 `REVIEW_PAYLOAD_FILE` cleanup fails, tell the user that stale derived
 local payload state remains and regenerate it from `REVIEW_DRAFT_FILE`
-or a refreshed draft instead of trusting it on a later submit.
+or a refreshed draft instead of trusting it on a later submit. If only
+`RUNTIME_STATE_FILE` cleanup fails, tell the user that stale
+review-owned runtime cleanup metadata remains and inspect or recreate it
+before trusting it on a later preflight.
 
 ## Comment Style
 
