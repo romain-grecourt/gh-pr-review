@@ -78,16 +78,19 @@ Apply the same `REVIEW_TREE` rule from `SKILL.md` before relying on local
 files as context. If local context is available, prefer a temporary
 review worktree created under `SKILL.md`; otherwise continue from GitHub
 diff and metadata. Do not mutate the user's checkout just to make it
-match the PR head.
+match the PR head. Carry `REVIEW_TREE_CREATED=0` through the submission
+flow and set it to `1` only after `git worktree add` succeeds under the
+`SKILL.md` local-context rules.
 
 Normalize `PR_REPO` by replacing `/` with `__`, then define the draft
-artifact path:
+artifact path and the derived review-payload path:
 
 ```bash
 PR_NUMBER="<resolved-pr-number>"
 PR_REPO_SAFE="${PR_REPO//\//__}"
 REVIEW_DRAFT_DIR="${TMPDIR:-/tmp}/codex-gh-pr-review"
 REVIEW_DRAFT_FILE="$REVIEW_DRAFT_DIR/${PR_REPO_SAFE}__pr-${PR_NUMBER}.json"
+REVIEW_PAYLOAD_FILE="$REVIEW_DRAFT_DIR/${PR_REPO_SAFE}__pr-${PR_NUMBER}__review.json"
 ```
 
 2. Confirm the displayed draft is still current.
@@ -147,16 +150,22 @@ If finalization succeeds without changing visible review content,
 overwrite `REVIEW_DRAFT_FILE` in place with the finalized canonical
 review. Add exact GitHub `position` values to each retained inline
 comment and keep the existing `draft_id`. After this write,
-`REVIEW_DRAFT_FILE` itself is the only submit-ready source of truth.
+`REVIEW_DRAFT_FILE` itself is the only finalized source of truth used to
+build the GitHub payload.
 
 4. Convert the approved canonical review into one complete review payload.
 
-Create a JSON payload from the approved canonical review. Its visible
-review content must match the last draft shown to the user. Include the
-reviewed `commit_id`, the final review `body`, the review `event`, and a
-`comments` array only for inline comments that were already retained in
-that canonical review. Read these values from `REVIEW_DRAFT_FILE`, not
-from ad-hoc reassembly. When anchor failures promoted findings into the
+Create a JSON payload from the approved canonical review by projecting
+`REVIEW_DRAFT_FILE` down to the GitHub reviews API schema. Its visible
+review content must match the last draft shown to the user. Keep only
+the reviewed `commit_id`, the final review `body`, the review `event`,
+and a `comments` array only for inline comments that were already
+retained in that canonical review. For each retained inline comment,
+keep only `path`, `position`, and `body`. Read these values from
+`REVIEW_DRAFT_FILE`, not from ad-hoc reassembly. Drop `draft_id`,
+`pr_repo`, `pr_number`, `base_ref_name`, `diff_fingerprint`,
+`discussion_fingerprint`, and each comment's `anchor` metadata from
+`REVIEW_PAYLOAD_FILE`. When anchor failures promoted findings into the
 body, the final review body may exceed the normal summary limit to
 enumerate only those promoted findings. At this step,
 `REVIEW_DRAFT_FILE` must already be the finalized canonical review and
@@ -188,25 +197,37 @@ instead of guessing during submission.
 
 5. Submit the review once.
 
-Materialize `review.json` directly from the finalized contents of
-`REVIEW_DRAFT_FILE`, then submit it.
+Materialize `REVIEW_PAYLOAD_FILE` by applying that projection to the
+finalized contents of `REVIEW_DRAFT_FILE`, then submit it.
+`REVIEW_DRAFT_FILE` remains the only cross-turn source of truth;
+`REVIEW_PAYLOAD_FILE` is disposable derived output for the single
+GitHub write.
 
 ```bash
-gh api -X POST "repos/$PR_OWNER/$PR_NAME/pulls/$PR_NUMBER/reviews" --input review.json
+gh api -X POST "repos/$PR_OWNER/$PR_NAME/pulls/$PR_NUMBER/reviews" --input "$REVIEW_PAYLOAD_FILE"
 ```
 
 6. After successful submission or after abandoning the review, remove any
-temporary review worktree created for it and delete `REVIEW_DRAFT_FILE`.
+temporary review worktree created for it and delete
+`REVIEW_DRAFT_FILE` plus `REVIEW_PAYLOAD_FILE`.
 
 ```bash
-git worktree remove "$REVIEW_TREE"
+if [ "${REVIEW_TREE_CREATED:-0}" = "1" ]; then
+  git worktree remove "$REVIEW_TREE" || exit 1
+fi
 rm -f "$REVIEW_DRAFT_FILE"
+rm -f "$REVIEW_PAYLOAD_FILE"
 ```
 
-Do not force-remove a dirty temporary review worktree. If worktree
-cleanup fails, stop and tell the user. If draft-artifact cleanup fails,
-tell the user that stale local draft state remains and rebuild instead
-of trusting it on a later submit.
+If no temporary review worktree was created, skip the worktree-removal
+step. Do not force-remove a dirty temporary review worktree. If
+worktree cleanup fails, stop immediately and do not delete
+`REVIEW_DRAFT_FILE` or `REVIEW_PAYLOAD_FILE`. If draft-artifact cleanup
+fails, tell the user that stale local draft state remains and rebuild
+instead of trusting it on a later submit. If only
+`REVIEW_PAYLOAD_FILE` cleanup fails, tell the user that stale derived
+local payload state remains and regenerate it from `REVIEW_DRAFT_FILE`
+or a refreshed draft instead of trusting it on a later submit.
 
 ## Comment Style
 

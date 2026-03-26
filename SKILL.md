@@ -65,6 +65,9 @@ Use two output modes:
   where `<pr-repo-safe>` is the resolved `PR_REPO` with `/` replaced by
   `__`. Treat that artifact as the only cross-turn source of truth for
   the draft-to-submit handoff.
+- Any separate `review.json` payload file used for submission is a
+  disposable derived artifact only. Rebuild it from the finalized draft
+  artifact when needed, and do not treat it as cross-turn state.
 - During submit-time finalization, overwrite that same artifact with the
   finalized canonical review used for submission. Hidden fields such as
   exact GitHub diff `position` values may be added in place. If
@@ -188,11 +191,13 @@ gh api --paginate "repos/$PR_OWNER/$PR_NAME/pulls/$PR_NUMBER/reviews?per_page=10
   same commit:
 
 ```bash
+REVIEW_TREE_CREATED=0
 git cat-file -e "${headRefOid}^{commit}" 2>/dev/null || \
   git fetch --no-tags <remote-for-pr-repo> "pull/<pr>/head"
 REVIEW_HEAD=$(git rev-parse "${headRefOid}^{commit}" 2>/dev/null || git rev-parse FETCH_HEAD)
 REVIEW_TREE=$(mktemp -d "${TMPDIR:-/tmp}/codex-pr-review.XXXXXX")
 git worktree add --detach "$REVIEW_TREE" "$REVIEW_HEAD"
+REVIEW_TREE_CREATED=1
 ```
 
 - Determine `<remote-for-pr-repo>` by matching a `git remote -v` fetch URL
@@ -211,9 +216,12 @@ git worktree add --detach "$REVIEW_TREE" "$REVIEW_HEAD"
   worktree created for it:
 
 ```bash
-git worktree remove "$REVIEW_TREE"
+if [ "${REVIEW_TREE_CREATED:-0}" = "1" ]; then
+  git worktree remove "$REVIEW_TREE"
+fi
 ```
 
+- If no temporary review worktree was created, skip worktree cleanup.
 - Do not force-remove a dirty temporary review worktree. If cleanup fails,
   stop and tell the user.
 - Do not auto-run `gh pr checkout`, `git switch`, or other commands that
@@ -286,7 +294,8 @@ rg --files | rg "Test|IT|Spec"
   existing-comment review.
 - The per-PR draft artifact must be valid JSON with this schema. The
   same file starts as the displayed draft artifact and, after
-  submit-time finalization, becomes the finalized submit-ready artifact:
+  submit-time finalization, becomes the finalized canonical draft
+  artifact used to build the submission payload:
 
 ```json
 {
@@ -328,10 +337,16 @@ rg --files | rg "Test|IT|Spec"
   discussion data. Do not require a separate preview hash or other
   hidden in-memory state to resume submission.
 - The example above shows `position` only to document the finalized
-  submit-ready form. Omit `position` in the ordinary displayed draft
-  artifact. During submit-time finalization, add exact GitHub
-  `position` values back into each retained inline comment in that same
-  artifact before submission.
+  draft form. Omit `position` in the ordinary displayed draft artifact.
+  During submit-time finalization, add exact GitHub `position` values
+  back into each retained inline comment in that same artifact before
+  submission.
+- The finalized draft artifact is richer than the GitHub reviews API
+  payload. When building the submission payload, keep only `event`,
+  `commit_id`, `body`, and each retained comment's `path`, `position`,
+  and `body`. Drop `draft_id`, `pr_repo`, `pr_number`,
+  `base_ref_name`, `diff_fingerprint`, `discussion_fingerprint`, and
+  each comment's `anchor` metadata from the payload.
 - Treat `anchor` as hidden metadata for submit-time relocation. It does
   not need to be rendered in the user-visible draft preview, but every
   inline comment kept in the draft must retain enough anchor metadata to
