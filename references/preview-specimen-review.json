@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "repo": "romain-grecourt/helidon-build-tools",
+  "pr_number": 5,
+  "head_sha": "03c200944cdff5a6fa49474cd9172c9527229d1d",
+  "diff_fingerprint": "3c2e337689916f241302ce2be9c6ab08434d3e53d8e5861e4174a4d6700fcbb2",
+  "body": "Specimen overall review body for preview rendering.\nThis file is intentionally not meant for submission.",
+  "findings": [
+    {
+      "path": ".agents/skills/helidon-archetype-regression/SKILL.md",
+      "side": "right",
+      "line": 22,
+      "body": "Dummy finding against the skill instructions.\nSecond line to exercise multi-line inline comment rendering."
+    },
+    {
+      "path": ".agents/skills/helidon-archetype-regression/references/workflow.md",
+      "side": "right",
+      "line": 62,
+      "body": "Dummy finding against the workflow reference."
+    },
+    {
+      "path": ".agents/skills/helidon-archetype-regression/scripts/run-regression.sh",
+      "side": "right",
+      "line": 150,
+      "body": "Dummy finding against the regression wrapper script.\n\nThis one includes a blank line to exercise paragraph rendering."
+    }
+  ]
+}
