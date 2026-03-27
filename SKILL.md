@@ -95,6 +95,10 @@ anchors from the live patch after validating `head_sha` and
 
 - Prioritize bugs, regressions, risky assumptions, compatibility issues,
   hidden failures, and missing focused tests.
+- Only perform static analysis. Aside from read-only `gh`/`git` commands used
+  to obtain PR context, do not execute the reviewed code or any
+  project-provided command or script, including tests, builds, linters,
+  formatters, package-manager tasks, instrumentation, or runtime probes.
 - Keep findings concrete, anchored, and high-value. Skip style-only remarks
   unless they hide a real defect.
 - Use `findings` for points that can be anchored to the diff.
