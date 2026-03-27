@@ -73,6 +73,7 @@ STYLE_HIGHLIGHT=""
 STYLE_NOTE=""
 STYLE_WARN=""
 FINDING_DIVIDER="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+PREVIEW_WRAP_COLUMNS=80
 
 init_preview_styles() {
   :
@@ -154,7 +155,19 @@ render_json_atomically() {
   local source_file="$1"
   local destination="$2"
 
-  jq '.' "$source_file" | write_stream_atomically "$destination"
+  jq '
+    if (.findings | type) == "array" then
+      .findings |= map(
+        if (.side | type) == "string" then
+          .side |= ascii_downcase
+        else
+          .
+        end
+      )
+    else
+      .
+    end
+  ' "$source_file" | write_stream_atomically "$destination"
 }
 
 review_dir_for_identity() {
@@ -303,7 +316,8 @@ validate_review_json_file() {
       type == "object"
       and ((keys | sort) == ["body", "line", "path", "side"])
       and (.path | repo_path)
-      and (.side == "left" or .side == "right")
+      and ((.side | type) == "string")
+      and ((.side | ascii_downcase) == "left" or (.side | ascii_downcase) == "right")
       and (.line | positive_integer)
       and (.body | type == "string" and length > 0)
     )
@@ -789,7 +803,7 @@ render_finding_hunk_context() {
 
     printf -v display_number '%4s' "$row_display"
     if [[ "$row_marker" == "1" ]]; then
-      printf '  %b▶%b %b%s | %s%b\n' "$STYLE_HIGHLIGHT" "$COLOR_RESET" "$STYLE_HIGHLIGHT" "$display_number" "$row_text" "$COLOR_RESET"
+      printf '  %b>%b %b%s | %s%b\n' "$STYLE_HIGHLIGHT" "$COLOR_RESET" "$STYLE_HIGHLIGHT" "$display_number" "$row_text" "$COLOR_RESET"
     else
       printf '    %b%s | %s%b\n' "$line_style" "$display_number" "$row_text" "$COLOR_RESET"
     fi
@@ -799,12 +813,31 @@ render_finding_hunk_context() {
 render_note_block() {
   local body_text="$1"
   local line=""
+  local wrapped_line=""
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ -n "$line" ]]; then
-      printf '  %b|%b %s\n' "$STYLE_NOTE" "$COLOR_RESET" "$line"
+      while IFS= read -r wrapped_line || [[ -n "$wrapped_line" ]]; do
+        printf '  %b|%b %s\n' "$STYLE_NOTE" "$COLOR_RESET" "$wrapped_line"
+      done < <(fold -s -w "$PREVIEW_WRAP_COLUMNS" <<<"$line" | sed 's/[[:space:]]*$//')
     else
       printf '  %b|%b\n' "$STYLE_NOTE" "$COLOR_RESET"
+    fi
+  done <<<"$body_text"
+}
+
+render_wrapped_body() {
+  local body_text="$1"
+  local line=""
+  local wrapped_line=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -n "$line" ]]; then
+      while IFS= read -r wrapped_line || [[ -n "$wrapped_line" ]]; do
+        printf '%s\n' "$wrapped_line"
+      done < <(fold -s -w "$PREVIEW_WRAP_COLUMNS" <<<"$line" | sed 's/[[:space:]]*$//')
+    else
+      printf '\n'
     fi
   done <<<"$body_text"
 }
@@ -826,7 +859,7 @@ build_review_payload() {
 
   while IFS= read -r finding_json; do
     path="$(printf '%s\n' "$finding_json" | jq -r '.path')"
-    side="$(printf '%s\n' "$finding_json" | jq -r '.side')"
+    side="$(printf '%s\n' "$finding_json" | jq -r '.side | ascii_downcase')"
     line="$(printf '%s\n' "$finding_json" | jq -r '.line')"
     position="$(resolve_diff_position "$patch_file" "$path" "$side" "$line")"
 
@@ -1053,7 +1086,7 @@ command_preview() {
     while IFS= read -r finding_json; do
       finding_index="$((finding_index + 1))"
       finding_path="$(printf '%s\n' "$finding_json" | jq -r '.path')"
-      finding_side="$(printf '%s\n' "$finding_json" | jq -r '.side')"
+      finding_side="$(printf '%s\n' "$finding_json" | jq -r '.side | ascii_downcase')"
       finding_line="$(printf '%s\n' "$finding_json" | jq -r '.line')"
       finding_body="$(printf '%s\n' "$finding_json" | jq -r '.body')"
 
@@ -1076,7 +1109,7 @@ command_preview() {
   review_body="$(jq -r '.body' "$REVIEW_FILE")" || die "$EXIT_REVIEW" "unable to read the review body."
   printf '📋 Review Body\n\n'
   if [[ -n "$review_body" ]]; then
-    printf '%s\n' "$review_body"
+    render_wrapped_body "$review_body"
   else
     printf '%b(empty)%b\n' "$STYLE_META" "$COLOR_RESET"
   fi

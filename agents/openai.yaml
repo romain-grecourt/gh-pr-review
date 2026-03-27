@@ -1,4 +1,4 @@
 interface:
   display_name: "GitHub PR Review"
   short_description: "Review GitHub.com pull requests for bugs and risk."
-  default_prompt: "Use $gh-pr-review to review a GitHub.com pull request reachable through gh by obtaining PR metadata, diff, and file context directly as needed, drafting a complete review JSON v1 locally, persisting it with save, showing preview output verbatim, iterating through save plus preview for edits, and submitting only the exact currently displayed saved review file after explicit approval if head_sha and diff_fingerprint still match."
+  default_prompt: "Use $gh-pr-review to review a GitHub.com pull request reachable through gh by obtaining PR metadata, diff, and file context directly as needed, drafting a complete review JSON v1 locally, persisting it with save, showing preview output verbatim, iterating through save plus preview for edits, always running preview and submit with escalated execution, and submitting only the exact currently displayed saved review file after explicit approval if head_sha and diff_fingerprint still match."

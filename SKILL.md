@@ -35,6 +35,10 @@ directory. Temporary files in `/tmp` are fine when needed.
 reachable, it may also show contextual diff hunks around findings. `save`,
 `ls`, and `submit` remain bound to the canonical `.reviews` store.
 
+Always request escalated execution for `gh-pr-review.sh preview` and
+`gh-pr-review.sh submit`. Do not first run either command in the sandbox and
+retry only after a network failure.
+
 `save` stores a complete review JSON document. Do not reintroduce or document
 incremental mutation commands or script-owned draft assembly.
 
@@ -79,14 +83,15 @@ anchors from the live patch after validating `head_sha` and
    - update an existing draft:
      `gh-pr-review.sh save --input TEMP_FILE --review-file EXISTING_FILE`
 9. Capture the saved path printed by `save`.
-10. Run `gh-pr-review.sh preview --review-file SAVED_FILE`.
+10. Run `gh-pr-review.sh preview --review-file SAVED_FILE` with escalated
+    execution.
 11. Show the preview stdout verbatim. Do not restyle it, summarize it, or
     reconstruct the format. Then ask the user `edit or submit`.
 12. Any edit invalidates prior approval.
 13. If the user requests edits, update the JSON content, run `save` again, and
     then run `preview` again.
-14. Run `submit` only after the user explicitly approves the currently
-    displayed preview.
+14. Run `submit` with escalated execution only after the user explicitly
+    approves the currently displayed preview.
 15. If `submit` reports stale `head_sha` or `diff_fingerprint`, leave that file
     untouched and create the next numbered attempt for the new PR state.
 16. Never reuse a submitted review file for new content.
