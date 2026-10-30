@@ -19,6 +19,7 @@ Usage:
   $SCRIPT_NAME save --input FILE [--review-file FILE]
   $SCRIPT_NAME preview --review-file FILE
   $SCRIPT_NAME submit --review-file FILE
+  $SCRIPT_NAME reconcile --review-file FILE [--github-review-id ID]
   $SCRIPT_NAME help
 
 Exit codes:
@@ -286,9 +287,6 @@ validate_review_json_file() {
     def sha1_hex:
       type == "string" and test("^[0-9a-f]{40}$");
 
-    def sha256_hex:
-      type == "string" and test("^[0-9a-f]{64}$");
-
     def repo_path:
       type == "string"
       and length > 0
@@ -296,32 +294,20 @@ validate_review_json_file() {
       and (contains("\n") | not)
       and (contains("\r") | not);
 
-    type == "object"
-    and (
-      (keys | sort)
-      == (
-        ["body", "diff_fingerprint", "findings", "head_sha", "pr_number", "repo", "version"]
-        + (if has("submission") then ["submission"] else [] end)
-        | sort
-      )
-    )
-    and (.version == 1)
-    and (.repo | repo_slug)
-    and (.pr_number | positive_integer)
-    and (.head_sha | sha1_hex)
-    and (.diff_fingerprint | sha256_hex)
-    and (.body | type == "string")
-    and (.findings | type == "array")
-    and all(.findings[]?;
-      type == "object"
-      and ((keys | sort) == ["body", "line", "path", "side"])
-      and (.path | repo_path)
-      and ((.side | type) == "string")
-      and ((.side | ascii_downcase) == "left" or (.side | ascii_downcase) == "right")
-      and (.line | positive_integer)
-      and (.body | type == "string" and length > 0)
-    )
-    and (
+    def findings:
+      type == "array"
+      and all(.[]?;
+        type == "object"
+        and ((keys | sort) == ["body", "line", "path", "side"])
+        and (.path | repo_path)
+        and ((.side | type) == "string")
+        and ((.side | ascii_downcase) == "left"
+          or (.side | ascii_downcase) == "right")
+        and (.line | positive_integer)
+        and (.body | type == "string" and length > 0)
+      );
+
+    def submission:
       if has("submission") then
         (.submission
           | type == "object"
@@ -331,26 +317,87 @@ validate_review_json_file() {
         )
       else
         true
+      end;
+
+    def common:
+      type == "object"
+      and (.repo | repo_slug)
+      and (.pr_number | positive_integer)
+      and (.head_sha | sha1_hex)
+      and (.body | type == "string")
+      and (.findings | findings)
+      and submission;
+
+    common
+    and (
+      if .version == 1 then
+        (keys | sort)
+        == (
+          ["body", "diff_fingerprint", "findings", "head_sha",
+            "pr_number", "repo", "version"]
+          + (if has("event") then ["event"] else [] end)
+          + (if has("submission") then ["submission"] else [] end)
+          | sort
+        )
+        and (.diff_fingerprint
+          | type == "string" and test("^[0-9a-f]{64}$"))
+        and (
+          if has("event") then
+            (.event == "COMMENT" or .event == "APPROVE"
+              or .event == "REQUEST_CHANGES")
+          else
+            true
+          end
+        )
+      elif .version == 2 then
+        (keys | sort)
+        == (
+          ["base_sha", "body", "event", "findings", "head_sha",
+            "pr_number", "repo", "version"]
+          + (if has("submission") then ["submission"] else [] end)
+          | sort
+        )
+        and (.base_sha | sha1_hex)
+        and (.event == "COMMENT" or .event == "APPROVE"
+          or .event == "REQUEST_CHANGES")
+      else
+        false
       end
     )
-  ' "$file_path" >/dev/null 2>&1 || die "$EXIT_REVIEW" "review file does not match review JSON v1: $file_path"
+  ' "$file_path" >/dev/null 2>&1 ||
+    die "$EXIT_REVIEW" \
+      "review file does not match review JSON v1 or v2: $file_path"
 }
 
 REVIEW_FILE=""
+REVIEW_VERSION=""
 REVIEW_REPO=""
 REVIEW_PR_NUMBER=""
+REVIEW_BASE_SHA=""
 REVIEW_HEAD_SHA=""
 REVIEW_DIFF_FINGERPRINT=""
+REVIEW_EVENT=""
 REVIEW_HAS_SUBMISSION=""
 
 load_review_metadata() {
   local file_path="$1"
-  local metadata
-
   validate_review_json_file "$file_path"
-  metadata="$(jq -r '[.repo, (.pr_number | tostring), .head_sha, .diff_fingerprint, (has("submission") | tostring)] | @tsv' "$file_path")" || die "$EXIT_REVIEW" "unable to read review metadata: $file_path"
-
-  IFS=$'\t' read -r REVIEW_REPO REVIEW_PR_NUMBER REVIEW_HEAD_SHA REVIEW_DIFF_FINGERPRINT REVIEW_HAS_SUBMISSION <<<"$metadata"
+  REVIEW_VERSION="$(jq -r '.version' "$file_path")" ||
+    die "$EXIT_REVIEW" "unable to read review version: $file_path"
+  REVIEW_REPO="$(jq -r '.repo' "$file_path")" ||
+    die "$EXIT_REVIEW" "unable to read review repo: $file_path"
+  REVIEW_PR_NUMBER="$(jq -r '.pr_number' "$file_path")" ||
+    die "$EXIT_REVIEW" "unable to read review PR number: $file_path"
+  REVIEW_BASE_SHA="$(jq -r '.base_sha // empty' "$file_path")" ||
+    die "$EXIT_REVIEW" "unable to read review base: $file_path"
+  REVIEW_HEAD_SHA="$(jq -r '.head_sha' "$file_path")" ||
+    die "$EXIT_REVIEW" "unable to read review head: $file_path"
+  REVIEW_DIFF_FINGERPRINT="$(jq -r '.diff_fingerprint // empty' "$file_path")" ||
+    die "$EXIT_REVIEW" "unable to read review fingerprint: $file_path"
+  REVIEW_EVENT="$(jq -r '.event // "COMMENT"' "$file_path")" ||
+    die "$EXIT_REVIEW" "unable to read review event: $file_path"
+  REVIEW_HAS_SUBMISSION="$(jq -r 'has("submission")' "$file_path")" ||
+    die "$EXIT_REVIEW" "unable to read submission state: $file_path"
 }
 
 load_any_review_file() {
@@ -374,8 +421,11 @@ load_saved_review_file() {
 PREVIEW_CONTEXT_LABEL="review file only"
 PREVIEW_CONTEXT_STYLE=""
 PREVIEW_CONTEXT_AVAILABLE=0
-PREVIEW_CONTEXT_PATCH_FILE=""
+PREVIEW_CONTEXT_FILES_FILE=""
 PREVIEW_CONTEXT_TEMP_DIR=""
+PREVIEW_CONTEXT_STALE=0
+PREVIEW_CONTEXT_PARTIAL=0
+PREVIEW_CONTEXT_DETAIL=""
 
 cleanup_preview_context() {
   if [[ -n "$PREVIEW_CONTEXT_TEMP_DIR" && -d "$PREVIEW_CONTEXT_TEMP_DIR" ]]; then
@@ -385,66 +435,231 @@ cleanup_preview_context() {
   PREVIEW_CONTEXT_LABEL="review file only"
   PREVIEW_CONTEXT_STYLE="$STYLE_META"
   PREVIEW_CONTEXT_AVAILABLE=0
-  PREVIEW_CONTEXT_PATCH_FILE=""
+  PREVIEW_CONTEXT_FILES_FILE=""
   PREVIEW_CONTEXT_TEMP_DIR=""
+  PREVIEW_CONTEXT_STALE=0
+  PREVIEW_CONTEXT_PARTIAL=0
+  PREVIEW_CONTEXT_DETAIL=""
+}
+
+fetch_pr_state() {
+  local destination="$1"
+  local stderr_file="$2"
+
+  if ! gh pr view "$REVIEW_PR_NUMBER" -R "$REVIEW_REPO" \
+    --json baseRefOid,headRefOid >"$destination" 2>"$stderr_file"; then
+    return 1
+  fi
+
+  jq -e '
+    (.baseRefOid | type == "string" and test("^[0-9a-f]{40}$"))
+    and (.headRefOid | type == "string" and test("^[0-9a-f]{40}$"))
+  ' "$destination" >/dev/null 2>&1
+}
+
+is_diff_too_large_error() {
+  local stderr_file="$1"
+
+  grep -Eiq \
+    'diff[[:space:]_.-]+too[[:space:]_.-]*large|too[[:space:]]+large.*diff' \
+    "$stderr_file"
+}
+
+try_fetch_v1_patch() {
+  local destination="$1"
+  local stderr_file="$2"
+  local visibility_file="${destination}.visibility"
+  local visibility_stderr="${destination}.visibility.stderr"
+  local visibility=""
+
+  if gh pr diff "$REVIEW_PR_NUMBER" -R "$REVIEW_REPO" --patch \
+    --color=never >"$destination" 2>"$stderr_file"; then
+    return 0
+  fi
+
+  if ! is_diff_too_large_error "$stderr_file"; then
+    return 1
+  fi
+
+  if ! gh repo view "$REVIEW_REPO" --json visibility --jq .visibility \
+    >"$visibility_file" 2>"$visibility_stderr"; then
+    {
+      printf '%s\n' \
+        'review JSON v1 cannot validate this large PR because repository visibility could not be determined; create a new review JSON v2 draft with base_sha and head_sha.'
+      cat "$visibility_stderr"
+    } >"$stderr_file"
+    return 2
+  fi
+
+  visibility="$(tr '[:lower:]' '[:upper:]' <"$visibility_file")"
+  if [[ "$visibility" != "PUBLIC" ]]; then
+    printf '%s\n' \
+      'review JSON v1 cannot validate a large private PR; create a new review JSON v2 draft with base_sha and head_sha.' \
+      >"$stderr_file"
+    return 2
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    printf '%s\n' \
+      'review JSON v1 needs curl to validate a large public PR through its .patch endpoint; install curl or create a new review JSON v2 draft.' \
+      >"$stderr_file"
+    return 2
+  fi
+
+  curl --fail --location --silent --show-error \
+    "https://github.com/$REVIEW_REPO/pull/$REVIEW_PR_NUMBER.patch" \
+    >"$destination" 2>"$stderr_file"
+}
+
+fetch_paginated_array() {
+  local endpoint="$1"
+  local destination="$2"
+  local stderr_file="$3"
+  local pages_file="${destination}.pages"
+
+  if ! gh api --paginate --slurp "$endpoint" >"$pages_file" \
+    2>"$stderr_file"; then
+    return 1
+  fi
+
+  if ! jq -e 'type == "array" and all(.[]; type == "array")' \
+    "$pages_file" >/dev/null 2>&1; then
+    printf '%s\n' \
+      "GitHub returned an invalid paginated response for $endpoint" \
+      >"$stderr_file"
+    return 1
+  fi
+
+  jq '[.[][]]' "$pages_file" >"$destination"
+}
+
+write_finding_patch() {
+  local files_file="$1"
+  local finding_path="$2"
+  local destination="$3"
+
+  jq -er --arg path "$finding_path" '
+    first(.[] | select(.filename == $path))
+    | .patch
+    | select(type == "string" and length > 0)
+  ' "$files_file" >"$destination" 2>/dev/null
 }
 
 prepare_preview_context() {
   local finding_count="$1"
   local stderr_file=""
-  local head_file=""
+  local state_file=""
+  local current_base_sha=""
   local current_head_sha=""
   local current_fingerprint=""
+  local v1_patch_file=""
+  local patch_status=0
+  local finding_json=""
+  local finding_path=""
+  local finding_side=""
+  local finding_line=""
+  local finding_patch=""
+  local finding_index=0
 
   cleanup_preview_context
 
-  if [[ "$finding_count" == "0" ]]; then
-    PREVIEW_CONTEXT_LABEL="review file only"
-    PREVIEW_CONTEXT_STYLE="$STYLE_META"
-    return 0
-  fi
-
-  if ! command -v gh >/dev/null 2>&1 || ! have_hash_command; then
-    PREVIEW_CONTEXT_LABEL="review file only"
-    PREVIEW_CONTEXT_STYLE="$STYLE_META"
+  if ! command -v gh >/dev/null 2>&1; then
+    PREVIEW_CONTEXT_LABEL="offline validation"
+    PREVIEW_CONTEXT_STYLE="$STYLE_WARN"
+    PREVIEW_CONTEXT_DETAIL="GitHub CLI is unavailable."
     return 0
   fi
 
   PREVIEW_CONTEXT_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-gh-pr-review.preview.XXXXXX" 2>/dev/null || true)"
   if [[ -z "$PREVIEW_CONTEXT_TEMP_DIR" || ! -d "$PREVIEW_CONTEXT_TEMP_DIR" ]]; then
-    PREVIEW_CONTEXT_LABEL="review file only"
-    PREVIEW_CONTEXT_STYLE="$STYLE_META"
+    PREVIEW_CONTEXT_LABEL="offline validation"
+    PREVIEW_CONTEXT_STYLE="$STYLE_WARN"
+    PREVIEW_CONTEXT_DETAIL="Unable to create temporary preview storage."
     return 0
   fi
 
   stderr_file="$PREVIEW_CONTEXT_TEMP_DIR/stderr.log"
-  head_file="$PREVIEW_CONTEXT_TEMP_DIR/head.txt"
-  PREVIEW_CONTEXT_PATCH_FILE="$PREVIEW_CONTEXT_TEMP_DIR/current.patch"
+  state_file="$PREVIEW_CONTEXT_TEMP_DIR/state.json"
+  PREVIEW_CONTEXT_FILES_FILE="$PREVIEW_CONTEXT_TEMP_DIR/files.json"
 
-  if ! gh pr view "$REVIEW_PR_NUMBER" -R "$REVIEW_REPO" --json headRefOid --jq .headRefOid >"$head_file" 2>"$stderr_file"; then
-    cleanup_preview_context
-    return 0
-  fi
-
-  if ! gh pr diff "$REVIEW_PR_NUMBER" -R "$REVIEW_REPO" --patch --color=never >"$PREVIEW_CONTEXT_PATCH_FILE" 2>"$stderr_file"; then
-    cleanup_preview_context
-    return 0
-  fi
-
-  current_head_sha="$(cat "$head_file")"
-  current_fingerprint="$(sha256_file "$PREVIEW_CONTEXT_PATCH_FILE" 2>/dev/null || true)"
-  if [[ -z "$current_fingerprint" ]]; then
-    cleanup_preview_context
-    return 0
-  fi
-
-  PREVIEW_CONTEXT_AVAILABLE=1
-  PREVIEW_CONTEXT_STYLE="$STYLE_META"
-  if [[ "$current_head_sha" == "$REVIEW_HEAD_SHA" && "$current_fingerprint" == "$REVIEW_DIFF_FINGERPRINT" ]]; then
-    PREVIEW_CONTEXT_LABEL="live hunk context"
-  else
-    PREVIEW_CONTEXT_LABEL="live diff mismatch"
+  if ! fetch_pr_state "$state_file" "$stderr_file"; then
+    PREVIEW_CONTEXT_LABEL="offline validation"
     PREVIEW_CONTEXT_STYLE="$STYLE_WARN"
+    PREVIEW_CONTEXT_DETAIL="Unable to read live pull request state."
+    return 0
+  fi
+
+  current_base_sha="$(jq -r '.baseRefOid' "$state_file")"
+  current_head_sha="$(jq -r '.headRefOid' "$state_file")"
+
+  if [[ "$REVIEW_VERSION" == "2" ]]; then
+    if [[ "$current_base_sha" != "$REVIEW_BASE_SHA" ||
+      "$current_head_sha" != "$REVIEW_HEAD_SHA" ]]; then
+      PREVIEW_CONTEXT_STALE=1
+      PREVIEW_CONTEXT_DETAIL="Saved base/head SHAs do not match the live pull request."
+    fi
+  else
+    if [[ "$current_head_sha" != "$REVIEW_HEAD_SHA" ]]; then
+      PREVIEW_CONTEXT_STALE=1
+      PREVIEW_CONTEXT_DETAIL="Saved head SHA does not match the live pull request."
+    fi
+
+    v1_patch_file="$PREVIEW_CONTEXT_TEMP_DIR/current.patch"
+    try_fetch_v1_patch "$v1_patch_file" "$stderr_file" || patch_status=$?
+    if [[ "$patch_status" -eq 0 ]]; then
+      current_fingerprint="$(sha256_file "$v1_patch_file" 2>/dev/null || true)"
+      if [[ -z "$current_fingerprint" ]]; then
+        PREVIEW_CONTEXT_PARTIAL=1
+        PREVIEW_CONTEXT_DETAIL="Unable to fingerprint the live v1 patch."
+      elif [[ "$current_fingerprint" != "$REVIEW_DIFF_FINGERPRINT" ]]; then
+        PREVIEW_CONTEXT_STALE=1
+        PREVIEW_CONTEXT_DETAIL="Saved diff fingerprint does not match the live pull request."
+      fi
+    else
+      PREVIEW_CONTEXT_PARTIAL=1
+      PREVIEW_CONTEXT_DETAIL="$(sed -n '1p' "$stderr_file")"
+    fi
+  fi
+
+  if [[ "$finding_count" != "0" ]]; then
+    if fetch_paginated_array \
+      "repos/$REVIEW_REPO/pulls/$REVIEW_PR_NUMBER/files?per_page=100" \
+      "$PREVIEW_CONTEXT_FILES_FILE" "$stderr_file"; then
+      PREVIEW_CONTEXT_AVAILABLE=1
+    else
+      PREVIEW_CONTEXT_PARTIAL=1
+      if [[ -z "$PREVIEW_CONTEXT_DETAIL" ]]; then
+        PREVIEW_CONTEXT_DETAIL="Pull-request file context is unavailable."
+      fi
+    fi
+  fi
+
+  if [[ "$PREVIEW_CONTEXT_AVAILABLE" -eq 1 ]]; then
+    while IFS= read -r finding_json; do
+      finding_index="$((finding_index + 1))"
+      finding_path="$(jq -r '.path' <<<"$finding_json")"
+      finding_side="$(jq -r '.side | ascii_downcase' <<<"$finding_json")"
+      finding_line="$(jq -r '.line' <<<"$finding_json")"
+      finding_patch="$PREVIEW_CONTEXT_TEMP_DIR/finding-$finding_index.patch"
+
+      if ! write_finding_patch "$PREVIEW_CONTEXT_FILES_FILE" \
+        "$finding_path" "$finding_patch" ||
+        ! extract_patch_context "$finding_patch" "$finding_side" \
+          "$finding_line" >/dev/null; then
+        PREVIEW_CONTEXT_PARTIAL=1
+      fi
+    done < <(jq -c '.findings[]' "$REVIEW_FILE")
+  fi
+
+  if [[ "$PREVIEW_CONTEXT_STALE" -eq 1 ]]; then
+    PREVIEW_CONTEXT_LABEL="stale validation"
+    PREVIEW_CONTEXT_STYLE="$STYLE_WARN"
+  elif [[ "$PREVIEW_CONTEXT_PARTIAL" -eq 1 ]]; then
+    PREVIEW_CONTEXT_LABEL="partial validation"
+    PREVIEW_CONTEXT_STYLE="$STYLE_WARN"
+  else
+    PREVIEW_CONTEXT_LABEL="live validation"
+    PREVIEW_CONTEXT_STYLE="$STYLE_META"
   fi
 }
 
@@ -455,7 +670,6 @@ require_local_prerequisites() {
 require_submit_prerequisites() {
   require_local_prerequisites
   require_command gh
-  have_hash_command || die "$EXIT_PREREQ" "missing required command: shasum or sha256sum"
 }
 
 run_gh_auth_status() {
@@ -469,161 +683,19 @@ run_gh_auth_status() {
   exit "$EXIT_PREREQ"
 }
 
-resolve_diff_position() {
+extract_patch_context() {
   local patch_file="$1"
-  local target_path="$2"
-  local target_side="$3"
-  local target_line="$4"
-  local position
-
-  position="$(awk \
-    -v target_path="$target_path" \
-    -v target_side="$target_side" \
-    -v target_line="$target_line" \
-    '
-      function decode_path(raw, prefix) {
-        if (raw ~ /^".*"$/) {
-          raw = substr(raw, 2, length(raw) - 2)
-          gsub(/\\\\/, "\034", raw)
-          gsub(/\\"/, "\"", raw)
-          gsub(/\\t/, "\t", raw)
-          gsub(/\\n/, "\n", raw)
-          gsub(/\034/, "\\", raw)
-        }
-        if (raw != "/dev/null" && index(raw, prefix) == 1) {
-          raw = substr(raw, length(prefix) + 1)
-        }
-        return raw
-      }
-      function select_current_path() {
-        if (new_path == "/dev/null") {
-          current_path = old_path
-        } else {
-          current_path = new_path
-        }
-      }
-      BEGIN {
-        found = 0
-        current_path = ""
-        old_path = ""
-        new_path = ""
-        in_hunk = 0
-        position = 0
-      }
-      /^diff --git / {
-        current_path = ""
-        old_path = ""
-        new_path = ""
-        in_hunk = 0
-        position = 0
-        next
-      }
-      /^--- / {
-        old_path = decode_path(substr($0, 5), "a/")
-        next
-      }
-      /^\+\+\+ / {
-        new_path = decode_path(substr($0, 5), "b/")
-        select_current_path()
-        next
-      }
-      /^@@ / {
-        header = $0
-        sub(/^@@ -/, "", header)
-        sub(/ @@.*$/, "", header)
-        split(header, header_parts, " ")
-        left_spec = header_parts[1]
-        right_spec = header_parts[2]
-        sub(/^\+/, "", right_spec)
-        split(left_spec, left_parts, ",")
-        split(right_spec, right_parts, ",")
-        left_line = left_parts[1] + 0
-        right_line = right_parts[1] + 0
-        in_hunk = 1
-        next
-      }
-      {
-        if (!in_hunk) {
-          next
-        }
-
-        if ($0 == "\\ No newline at end of file") {
-          next
-        }
-
-        prefix = substr($0, 1, 1)
-        if (prefix != " " && prefix != "+" && prefix != "-") {
-          next
-        }
-
-        position += 1
-
-        if (current_path == target_path) {
-          if ((prefix == " " || prefix == "-") && target_side == "left" && left_line == target_line) {
-            print position
-            found = 1
-            exit
-          }
-          if ((prefix == " " || prefix == "+") && target_side == "right" && right_line == target_line) {
-            print position
-            found = 1
-            exit
-          }
-        }
-
-        if (prefix == " " || prefix == "-") {
-          left_line += 1
-        }
-        if (prefix == " " || prefix == "+") {
-          right_line += 1
-        }
-      }
-      END {
-        if (!found) {
-          exit 1
-        }
-      }
-    ' "$patch_file")" || die "$EXIT_STORAGE" "unable to resolve $target_path $target_side:$target_line against the live PR patch."
-
-  printf '%s\n' "$position"
-}
-
-extract_finding_hunk_context() {
-  local patch_file="$1"
-  local target_path="$2"
-  local target_side="$3"
-  local target_line="$4"
-  local radius="${5:-2}"
+  local target_side="$2"
+  local target_line="$3"
+  local radius="${4:-2}"
   local separator=$'\037'
 
   awk \
-    -v target_path="$target_path" \
     -v target_side="$target_side" \
     -v target_line="$target_line" \
     -v radius="$radius" \
     -v separator="$separator" \
     '
-      function decode_path(raw, prefix) {
-        if (raw ~ /^".*"$/) {
-          raw = substr(raw, 2, length(raw) - 2)
-          gsub(/\\\\/, "\034", raw)
-          gsub(/\\"/, "\"", raw)
-          gsub(/\\t/, "\t", raw)
-          gsub(/\\n/, "\n", raw)
-          gsub(/\034/, "\\", raw)
-        }
-        if (raw != "/dev/null" && index(raw, prefix) == 1) {
-          raw = substr(raw, length(prefix) + 1)
-        }
-        return raw
-      }
-      function select_current_path() {
-        if (new_path == "/dev/null") {
-          current_path = old_path
-        } else {
-          current_path = new_path
-        }
-      }
       function clear_hunk() {
         delete hunk_text
         delete hunk_display
@@ -634,7 +706,7 @@ extract_finding_hunk_context() {
         in_hunk = 0
       }
       function emit_hunk(    start, stop, i, marker) {
-        if (target_index == 0 || current_path != target_path) {
+        if (target_index == 0) {
           return
         }
         start = target_index - radius
@@ -654,30 +726,7 @@ extract_finding_hunk_context() {
       }
       BEGIN {
         found = 0
-        current_path = ""
-        old_path = ""
-        new_path = ""
         clear_hunk()
-      }
-      /^diff --git / {
-        if (target_index > 0) {
-          emit_hunk()
-          exit(found ? 0 : 1)
-        }
-        current_path = ""
-        old_path = ""
-        new_path = ""
-        clear_hunk()
-        next
-      }
-      /^--- / {
-        old_path = decode_path(substr($0, 5), "a/")
-        next
-      }
-      /^\+\+\+ / {
-        new_path = decode_path(substr($0, 5), "b/")
-        select_current_path()
-        next
       }
       /^@@ / {
         if (target_index > 0) {
@@ -738,13 +787,11 @@ extract_finding_hunk_context() {
         hunk_display[hunk_count] = display
         hunk_class[hunk_count] = line_class
 
-        if (current_path == target_path) {
-          if ((prefix == " " || prefix == "-") && target_side == "left" && left_line == target_line) {
-            target_index = hunk_count
-          }
-          if ((prefix == " " || prefix == "+") && target_side == "right" && right_line == target_line) {
-            target_index = hunk_count
-          }
+        if ((prefix == " " || prefix == "-") && target_side == "left" && left_line == target_line) {
+          target_index = hunk_count
+        }
+        if ((prefix == " " || prefix == "+") && target_side == "right" && right_line == target_line) {
+          target_index = hunk_count
         }
 
         if (prefix == " " || prefix == "-") {
@@ -765,11 +812,10 @@ extract_finding_hunk_context() {
     ' "$patch_file"
 }
 
-render_finding_hunk_context() {
+render_patch_context() {
   local patch_file="$1"
-  local target_path="$2"
-  local target_side="$3"
-  local target_line="$4"
+  local target_side="$2"
+  local target_line="$3"
   local excerpt=""
   local row=""
   local row_type=""
@@ -780,7 +826,8 @@ render_finding_hunk_context() {
   local line_style=""
   local display_number=""
 
-  excerpt="$(extract_finding_hunk_context "$patch_file" "$target_path" "$target_side" "$target_line")" || return 1
+  excerpt="$(extract_patch_context "$patch_file" "$target_side" \
+    "$target_line")" || return 1
 
   while IFS= read -r row || [[ -n "$row" ]]; do
     IFS=$'\037' read -r row_type row_marker row_class row_display row_text <<<"$row"
@@ -844,59 +891,33 @@ render_wrapped_body() {
 
 build_review_payload() {
   local review_file="$1"
-  local patch_file="$2"
-  local payload_file="$3"
-  local comments_file
-  local comments_count
-  local finding_json
-  local path
-  local side
-  local line
-  local position
-
-  comments_file="$(mktemp "${TMPDIR:-/tmp}/codex-gh-pr-review.comments.XXXXXX")" || die "$EXIT_SUBMIT" "unable to create a temporary comments file."
-  printf '[]\n' >"$comments_file"
-
-  while IFS= read -r finding_json; do
-    path="$(printf '%s\n' "$finding_json" | jq -r '.path')"
-    side="$(printf '%s\n' "$finding_json" | jq -r '.side | ascii_downcase')"
-    line="$(printf '%s\n' "$finding_json" | jq -r '.line')"
-    position="$(resolve_diff_position "$patch_file" "$path" "$side" "$line")"
-
-    jq \
-      --argjson finding "$finding_json" \
-      --argjson position "$position" \
-      '
-        . + [
-          {
-            path: $finding.path,
-            position: $position,
-            body: $finding.body
-          }
-        ]
-      ' "$comments_file" | write_stream_atomically "$comments_file"
-  done < <(jq -c '.findings[]' "$review_file")
-
-  comments_count="$(jq 'length' "$comments_file")" || die "$EXIT_SUBMIT" "unable to read resolved comment anchors."
-  [[ "$comments_count" == "$(jq '.findings | length' "$review_file")" ]] || die "$EXIT_SUBMIT" "resolved comment anchors do not match the saved findings."
+  local payload_file="$2"
 
   jq \
-    --slurpfile comments "$comments_file" \
     --arg commit_id "$REVIEW_HEAD_SHA" \
+    --arg event "$REVIEW_EVENT" \
     '
       {
-        event: "COMMENT",
+        event: $event,
         commit_id: $commit_id,
         body: .body
       }
-      + (if ($comments[0] | length) > 0 then
-          { comments: $comments[0] }
+      + (if (.findings | length) > 0 then
+          {
+            comments: [
+              .findings[]
+              | {
+                  path: .path,
+                  line: .line,
+                  side: (.side | ascii_upcase),
+                  body: .body
+                }
+            ]
+          }
         else
           {}
         end)
     ' "$review_file" >"$payload_file"
-
-  rm -f "$comments_file"
 }
 
 mark_review_submitted() {
@@ -909,6 +930,208 @@ mark_review_submitted() {
     --argjson github_review_id "$github_review_id" \
     '.submission = {submitted_at: $submitted_at, github_review_id: $github_review_id}' \
     "$review_file" | write_stream_atomically "$review_file"
+}
+
+review_event_state() {
+  case "$REVIEW_EVENT" in
+    COMMENT)
+      printf '%s\n' "COMMENTED"
+      ;;
+    APPROVE)
+      printf '%s\n' "APPROVED"
+      ;;
+    REQUEST_CHANGES)
+      printf '%s\n' "CHANGES_REQUESTED"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+command_reconcile() {
+  local review_file=""
+  local github_review_id=""
+  local temp_dir=""
+  local stderr_file=""
+  local reviews_file=""
+  local candidates_file=""
+  local comments_file=""
+  local authenticated_user=""
+  local expected_state=""
+  local candidate_id=""
+  local candidate_submitted_at=""
+  local matched_id=""
+  local matched_submitted_at=""
+  local verified_count=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --review-file)
+        [[ $# -ge 2 ]] || die "$EXIT_USAGE" \
+          "missing value for --review-file"
+        review_file="$2"
+        shift 2
+        ;;
+      --github-review-id)
+        [[ $# -ge 2 ]] || die "$EXIT_USAGE" \
+          "missing value for --github-review-id"
+        github_review_id="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        die "$EXIT_USAGE" "unknown argument for reconcile: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$review_file" ]] || die "$EXIT_USAGE" \
+    "reconcile requires --review-file FILE"
+  if [[ -n "$github_review_id" ]]; then
+    [[ "$github_review_id" =~ ^[0-9]+$ ]] || die "$EXIT_USAGE" \
+      "--github-review-id must be a positive integer"
+    [[ "$github_review_id" != "0" ]] || die "$EXIT_USAGE" \
+      "--github-review-id must be a positive integer"
+  fi
+
+  require_submit_prerequisites
+  load_saved_review_file "$review_file"
+  [[ "$REVIEW_HAS_SUBMISSION" == "false" ]] || die "$EXIT_STORAGE" \
+    "review file is already submitted: $REVIEW_FILE"
+  run_gh_auth_status
+
+  temp_dir="$(mktemp -d \
+    "${TMPDIR:-/tmp}/codex-gh-pr-review.reconcile.XXXXXX")" ||
+    die "$EXIT_SUBMIT" \
+      "unable to create a temporary reconciliation directory."
+  stderr_file="$temp_dir/stderr.log"
+  reviews_file="$temp_dir/reviews.json"
+  candidates_file="$temp_dir/candidates.json"
+  comments_file="$temp_dir/comments.json"
+
+  if ! authenticated_user="$(gh api user --jq .login 2>"$stderr_file")"; then
+    cat "$stderr_file" >&2
+    rm -rf "$temp_dir"
+    exit "$EXIT_SUBMIT"
+  fi
+  if [[ -z "$authenticated_user" ]]; then
+    rm -rf "$temp_dir"
+    die "$EXIT_SUBMIT" \
+      "reconcile failed: unable to identify the authenticated GitHub user."
+  fi
+
+  expected_state="$(review_event_state)" || {
+    rm -rf "$temp_dir"
+    die "$EXIT_REVIEW" \
+      "reconcile failed: unsupported review event $REVIEW_EVENT."
+  }
+
+  if ! fetch_paginated_array \
+    "repos/$REVIEW_REPO/pulls/$REVIEW_PR_NUMBER/reviews?per_page=100" \
+    "$reviews_file" "$stderr_file"; then
+    cat "$stderr_file" >&2
+    rm -rf "$temp_dir"
+    exit "$EXIT_SUBMIT"
+  fi
+
+  jq \
+    --slurpfile saved "$REVIEW_FILE" \
+    --arg user "$authenticated_user" \
+    --arg state "$expected_state" \
+    --arg requested_id "$github_review_id" \
+    '
+      def normalized:
+        gsub("\\r\\n"; "\n")
+        | gsub("\\r"; "\n")
+        | gsub("[ \\t\n]+"; " ")
+        | sub("^ "; "")
+        | sub(" $"; "");
+
+      [
+        .[]
+        | select(
+            $requested_id == ""
+            or (.id | tostring) == $requested_id
+          )
+        | select(
+            ((.user.login // "") | ascii_downcase)
+            == ($user | ascii_downcase)
+          )
+        | select(.commit_id == $saved[0].head_sha)
+        | select(.state == $state)
+        | select(
+            ((.body // "") | normalized)
+            == ($saved[0].body | normalized)
+          )
+      ]
+    ' "$reviews_file" >"$candidates_file"
+
+  while IFS=$'\t' read -r candidate_id candidate_submitted_at; do
+    if ! fetch_paginated_array \
+      "repos/$REVIEW_REPO/pulls/$REVIEW_PR_NUMBER/reviews/$candidate_id/comments?per_page=100" \
+      "$comments_file" "$stderr_file"; then
+      cat "$stderr_file" >&2
+      rm -rf "$temp_dir"
+      exit "$EXIT_SUBMIT"
+    fi
+
+    if jq -en \
+      --slurpfile saved "$REVIEW_FILE" \
+      --slurpfile comments "$comments_file" \
+      '
+        def normalized:
+          gsub("\\r\\n"; "\n")
+          | gsub("\\r"; "\n")
+          | gsub("[ \\t\n]+"; " ")
+          | sub("^ "; "")
+          | sub(" $"; "");
+
+        (
+          [
+            $saved[0].findings[]
+            | {path: .path, body: (.body | normalized)}
+          ]
+          | sort_by(.path, .body)
+        )
+        ==
+        (
+          [
+            $comments[0][]
+            | {path: .path, body: ((.body // "") | normalized)}
+          ]
+          | sort_by(.path, .body)
+        )
+      ' >/dev/null; then
+      if [[ -z "$candidate_submitted_at" ||
+        "$candidate_submitted_at" == "null" ]]; then
+        rm -rf "$temp_dir"
+        die "$EXIT_REVIEW" \
+          "reconcile failed: GitHub review $candidate_id has no submission time."
+      fi
+      verified_count="$((verified_count + 1))"
+      matched_id="$candidate_id"
+      matched_submitted_at="$candidate_submitted_at"
+    fi
+  done < <(jq -r '.[] | [.id, .submitted_at] | @tsv' "$candidates_file")
+
+  if [[ "$verified_count" -eq 0 ]]; then
+    rm -rf "$temp_dir"
+    die "$EXIT_REVIEW" \
+      "reconcile failed: no GitHub review matches the saved draft."
+  fi
+  if [[ "$verified_count" -ne 1 ]]; then
+    rm -rf "$temp_dir"
+    die "$EXIT_REVIEW" \
+      "reconcile failed: multiple GitHub reviews match the saved draft; retry with --github-review-id ID."
+  fi
+
+  mark_review_submitted "$REVIEW_FILE" "$matched_submitted_at" "$matched_id"
+  rm -rf "$temp_dir"
+  printf 'reconciled\n'
 }
 
 command_ls() {
@@ -975,8 +1198,10 @@ command_save() {
   local review_file=""
   local canonical_input_file=""
   local target_file=""
+  local input_version=""
   local input_repo=""
   local input_pr_number=""
+  local target_version=""
   local target_repo=""
   local target_pr_number=""
   local target_has_submission=""
@@ -1012,16 +1237,19 @@ command_save() {
 
   [[ "$REVIEW_HAS_SUBMISSION" == "false" ]] || die "$EXIT_STORAGE" "save only accepts draft review documents; submission metadata is script-owned."
 
+  input_version="$REVIEW_VERSION"
   input_repo="$REVIEW_REPO"
   input_pr_number="$REVIEW_PR_NUMBER"
 
   if [[ -n "$review_file" ]]; then
     load_saved_review_file "$review_file"
     target_file="$REVIEW_FILE"
+    target_version="$REVIEW_VERSION"
     target_repo="$REVIEW_REPO"
     target_pr_number="$REVIEW_PR_NUMBER"
     target_has_submission="$REVIEW_HAS_SUBMISSION"
 
+    [[ "$target_version" == "$input_version" ]] || die "$EXIT_STORAGE" "target review file version does not match the input document: $target_file"
     [[ "$target_repo" == "$input_repo" ]] || die "$EXIT_STORAGE" "target review file repo does not match the input document: $target_file"
     [[ "$target_pr_number" == "$input_pr_number" ]] || die "$EXIT_STORAGE" "target review file PR does not match the input document: $target_file"
     [[ "$target_has_submission" == "false" ]] || die "$EXIT_STORAGE" "refusing to overwrite a submitted review file: $target_file"
@@ -1042,6 +1270,7 @@ command_preview() {
   local finding_side=""
   local finding_line=""
   local finding_body=""
+  local finding_patch=""
   local review_body=""
 
   while [[ $# -gt 0 ]]; do
@@ -1071,11 +1300,23 @@ command_preview() {
   prepare_preview_context "$finding_count"
 
   printf '%bReview Preview%b  %b%s#%s%b\n' "$STYLE_HEADER" "$COLOR_RESET" "$STYLE_PATH" "$REVIEW_REPO" "$REVIEW_PR_NUMBER" "$COLOR_RESET"
-  printf '%bstate COMMENT  head %s  diff %s%b' "$STYLE_META" "$(short_hex "$REVIEW_HEAD_SHA")" "$(short_hex "$REVIEW_DIFF_FINGERPRINT")" "$COLOR_RESET"
+  if [[ "$REVIEW_VERSION" == "2" ]]; then
+    printf '%bv2  state %s  base %s  head %s%b' \
+      "$STYLE_META" "$REVIEW_EVENT" "$(short_hex "$REVIEW_BASE_SHA")" \
+      "$(short_hex "$REVIEW_HEAD_SHA")" "$COLOR_RESET"
+  else
+    printf '%bv1  state COMMENT  head %s  diff %s%b' \
+      "$STYLE_META" "$(short_hex "$REVIEW_HEAD_SHA")" \
+      "$(short_hex "$REVIEW_DIFF_FINGERPRINT")" "$COLOR_RESET"
+  fi
   if [[ -n "$PREVIEW_CONTEXT_LABEL" ]]; then
     printf '  %b%s%b\n' "$PREVIEW_CONTEXT_STYLE" "$PREVIEW_CONTEXT_LABEL" "$COLOR_RESET"
   else
     printf '\n'
+  fi
+  if [[ -n "$PREVIEW_CONTEXT_DETAIL" ]]; then
+    printf '%bvalidation note: %s%b\n' "$PREVIEW_CONTEXT_STYLE" \
+      "$PREVIEW_CONTEXT_DETAIL" "$COLOR_RESET"
   fi
   printf '\n'
 
@@ -1092,10 +1333,32 @@ command_preview() {
 
       printf '◆ Finding %s  %s  %s:%s\n' "$finding_index" "$finding_path" "$finding_side" "$finding_line"
       if [[ "$PREVIEW_CONTEXT_AVAILABLE" -eq 1 ]]; then
-        if ! render_finding_hunk_context "$PREVIEW_CONTEXT_PATCH_FILE" "$finding_path" "$finding_side" "$finding_line"; then
-          printf '  %b[live hunk context unavailable for this finding]%b\n' "$STYLE_WARN" "$COLOR_RESET"
+        finding_patch="$PREVIEW_CONTEXT_TEMP_DIR/render-$finding_index.patch"
+        if ! write_finding_patch "$PREVIEW_CONTEXT_FILES_FILE" \
+          "$finding_path" "$finding_patch"; then
+          printf '  %b[missing patch: GitHub did not provide context for this finding]%b\n' \
+            "$STYLE_WARN" "$COLOR_RESET"
+        else
+          if [[ "$PREVIEW_CONTEXT_STALE" -eq 1 ]]; then
+            printf '  %b[stale validation: context reflects the current PR state]%b\n' \
+              "$STYLE_WARN" "$COLOR_RESET"
+          fi
+          if ! render_patch_context "$finding_patch" "$finding_side" \
+            "$finding_line"; then
+            printf '  %b[partial validation: the saved line is absent from the available patch]%b\n' \
+              "$STYLE_WARN" "$COLOR_RESET"
+          fi
         fi
         printf '\n'
+      elif [[ "$PREVIEW_CONTEXT_LABEL" == "offline validation" ]]; then
+        printf '  %b[offline validation: live patch context is unavailable]%b\n\n' \
+          "$STYLE_WARN" "$COLOR_RESET"
+      elif [[ "$PREVIEW_CONTEXT_LABEL" == "stale validation" ]]; then
+        printf '  %b[stale validation: live patch context is unavailable]%b\n\n' \
+          "$STYLE_WARN" "$COLOR_RESET"
+      else
+        printf '  %b[partial validation: live patch context is unavailable]%b\n\n' \
+          "$STYLE_WARN" "$COLOR_RESET"
       fi
 
       render_note_block "$finding_body"
@@ -1120,14 +1383,17 @@ command_preview() {
 command_submit() {
   local review_file=""
   local temp_dir=""
+  local current_base_sha=""
   local current_head_sha=""
   local current_patch=""
   local current_fingerprint=""
+  local current_state=""
   local payload_file=""
   local response_file=""
   local stderr_file=""
   local github_review_id=""
   local submitted_at=""
+  local patch_status=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1151,40 +1417,65 @@ command_submit() {
   require_submit_prerequisites
   load_saved_review_file "$review_file"
   [[ "$REVIEW_HAS_SUBMISSION" == "false" ]] || die "$EXIT_STORAGE" "review file is already submitted: $REVIEW_FILE"
+  if [[ "$REVIEW_VERSION" == "1" ]]; then
+    have_hash_command || die "$EXIT_PREREQ" \
+      "missing required command: shasum or sha256sum"
+  fi
   run_gh_auth_status
 
   temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-gh-pr-review.submit.XXXXXX")" || die "$EXIT_SUBMIT" "unable to create a temporary submit directory."
   stderr_file="$temp_dir/stderr.log"
   current_patch="$temp_dir/current.patch"
+  current_state="$temp_dir/current-state.json"
   payload_file="$temp_dir/review-payload.json"
   response_file="$temp_dir/submit-response.json"
 
+  build_review_payload "$REVIEW_FILE" "$payload_file"
+
+  if [[ "$REVIEW_VERSION" == "1" ]]; then
+    : >"$stderr_file"
+    try_fetch_v1_patch "$current_patch" "$stderr_file" || patch_status=$?
+    if [[ "$patch_status" -ne 0 ]]; then
+      cat "$stderr_file" >&2
+      rm -rf "$temp_dir"
+      if [[ "$patch_status" -eq 2 ]]; then
+        exit "$EXIT_REVIEW"
+      fi
+      exit "$EXIT_SUBMIT"
+    fi
+
+    current_fingerprint="$(sha256_file "$current_patch")" || {
+      rm -rf "$temp_dir"
+      die "$EXIT_SUBMIT" \
+        "submit failed: unable to fingerprint the current PR patch."
+    }
+  fi
+
   : >"$stderr_file"
-  if ! current_head_sha="$(gh pr view "$REVIEW_PR_NUMBER" -R "$REVIEW_REPO" --json headRefOid --jq .headRefOid 2>"$stderr_file")"; then
+  if ! fetch_pr_state "$current_state" "$stderr_file"; then
     cat "$stderr_file" >&2
     rm -rf "$temp_dir"
     exit "$EXIT_SUBMIT"
   fi
 
-  : >"$stderr_file"
-  if ! gh pr diff "$REVIEW_PR_NUMBER" -R "$REVIEW_REPO" --patch --color=never >"$current_patch" 2>"$stderr_file"; then
-    cat "$stderr_file" >&2
-    rm -rf "$temp_dir"
-    exit "$EXIT_SUBMIT"
-  fi
-
-  current_fingerprint="$(sha256_file "$current_patch")" || die "$EXIT_SUBMIT" "submit failed: unable to fingerprint the current PR patch."
+  current_base_sha="$(jq -r '.baseRefOid' "$current_state")"
+  current_head_sha="$(jq -r '.headRefOid' "$current_state")"
 
   if [[ "$current_head_sha" != "$REVIEW_HEAD_SHA" ]]; then
     rm -rf "$temp_dir"
     die "$EXIT_REVIEW" "submit failed: the PR head changed since this review was saved."
   fi
-  if [[ "$current_fingerprint" != "$REVIEW_DIFF_FINGERPRINT" ]]; then
+  if [[ "$REVIEW_VERSION" == "2" ]]; then
+    if [[ "$current_base_sha" != "$REVIEW_BASE_SHA" ]]; then
+      rm -rf "$temp_dir"
+      die "$EXIT_REVIEW" \
+        "submit failed: the PR base changed since this review was saved."
+    fi
+  elif [[ "$current_fingerprint" != "$REVIEW_DIFF_FINGERPRINT" ]]; then
     rm -rf "$temp_dir"
-    die "$EXIT_REVIEW" "submit failed: the PR diff changed since this review was saved."
+    die "$EXIT_REVIEW" \
+      "submit failed: the PR diff changed since this review was saved."
   fi
-
-  build_review_payload "$REVIEW_FILE" "$current_patch" "$payload_file"
 
   : >"$stderr_file"
   if ! gh api -X POST "repos/$REVIEW_REPO/pulls/$REVIEW_PR_NUMBER/reviews" --input "$payload_file" >"$response_file" 2>"$stderr_file"; then
@@ -1226,6 +1517,9 @@ main() {
       ;;
     submit)
       command_submit "$@"
+      ;;
+    reconcile)
+      command_reconcile "$@"
       ;;
     help|-h|--help)
       usage

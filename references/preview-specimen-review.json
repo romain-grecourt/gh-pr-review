@@ -1,9 +1,10 @@
 {
-  "version": 1,
+  "version": 2,
   "repo": "romain-grecourt/helidon-build-tools",
   "pr_number": 5,
+  "base_sha": "1111111111111111111111111111111111111111",
   "head_sha": "03c200944cdff5a6fa49474cd9172c9527229d1d",
-  "diff_fingerprint": "3c2e337689916f241302ce2be9c6ab08434d3e53d8e5861e4174a4d6700fcbb2",
+  "event": "COMMENT",
   "body": "Specimen overall review body for preview rendering.\nThis file is intentionally not meant for submission.",
   "findings": [
     {
